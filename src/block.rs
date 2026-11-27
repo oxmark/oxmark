@@ -344,11 +344,15 @@ impl<'a, 'o> BlockParser<'a, 'o> {
         self.scratch.get_mut().footnotes.defs = std::mem::take(&mut self.footnote_defs);
         let children = self.convert_children(0);
         let footnotes = self.convert_footnotes();
-        ast::Document {
+        let mut doc = ast::Document {
             frontmatter,
             children,
             footnotes,
+        };
+        if self.opts.html {
+            crate::html_tree::transform(&mut doc);
         }
+        doc
     }
 
     // ----- line state -----
@@ -1127,7 +1131,13 @@ impl<'a, 'o> BlockParser<'a, 'o> {
         let Some(t) = html_block_start(rest) else {
             return Start::None;
         };
-        if t == 7
+        // Comark only starts HTML blocks for raw-text tags and comments, and a
+        // comment cannot interrupt a paragraph. Other tags start paragraphs,
+        // so the Markdown inside them is parsed.
+        if self.opts.html && !matches!(t, 1 | 2) {
+            return Start::None;
+        }
+        if (t == 7 || (t == 2 && self.opts.html))
             && (matches!(self.nodes[container].kind, Kind::Paragraph)
                 || (!self.all_closed
                     && !self.blank

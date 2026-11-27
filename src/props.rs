@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::ast::Attributes;
+use crate::ast::{Attribute, Attributes};
 use crate::block::to_cow;
 
 /// A parsed attribute list.
@@ -173,10 +173,13 @@ pub(crate) fn search<'a>(src: &'a str, s: &str, start: usize) -> Option<Props<'a
         i: start + 1,
         groups: HashMap::new(),
     };
-    let mut attrs = Attributes::default();
+    let mut attrs = Vec::new();
     let mut closed = false;
-    let push = |attrs: &mut Attributes<'a>, name: Cow<'a, str>, value: &str| {
-        attrs.set(name, to_cow(src, unquote(value)));
+    let push = |attrs: &mut Vec<Attribute<'a>>, name: Cow<'a, str>, value: &str| {
+        attrs.push(Attribute {
+            name,
+            value: to_cow(src, unquote(value)),
+        });
     };
     while sc.i < sc.b.len() {
         match sc.b[sc.i] {
@@ -227,7 +230,7 @@ pub(crate) fn search<'a>(src: &'a str, s: &str, start: usize) -> Option<Props<'a
         }
     }
     Some(Props {
-        attrs,
+        attrs: Attributes::from_list(attrs, true),
         end: sc.i.min(sc.b.len()),
         closed,
     })

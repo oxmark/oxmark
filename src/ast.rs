@@ -5,9 +5,10 @@
 //! when the text had to be transformed (entities, backslash escapes, content
 //! split across container prefixes such as `>` or list indentation).
 //!
-//! The tree is faithful to the source: raw HTML, every URL and every
-//! attribute are kept as written. Sanitizing happens when rendering, see
-//! [`HtmlOptions`](crate::HtmlOptions).
+//! The tree is faithful to the source: every URL and every attribute are
+//! kept as written, and raw HTML too, either verbatim or, with
+//! [`Options::html`](crate::Options::html), as [`HtmlElement`]s. Sanitizing
+//! happens when rendering, see [`HtmlOptions`](crate::HtmlOptions).
 
 use std::borrow::Cow;
 
@@ -71,6 +72,37 @@ pub enum Block<'a> {
     Table(Table<'a>),
     /// A Comark block component (`::name{props}` ... `::`).
     Component(Component<'a>),
+    /// An HTML element at block level, when
+    /// [`Options::html`](crate::Options::html) is enabled.
+    HtmlElement(HtmlElement<'a>),
+    /// An HTML comment, a processing instruction or a declaration at block
+    /// level, when [`Options::html`](crate::Options::html) is enabled.
+    HtmlComment(Cow<'a, str>),
+}
+
+/// An HTML element parsed from raw HTML, like Comark does: tags become
+/// elements, and the Markdown between them becomes their children.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HtmlElement<'a> {
+    /// The tag name, lowercased when it was written in uppercase.
+    pub tag: Cow<'a, str>,
+    /// The attributes, with names lowercased and character references in
+    /// values decoded. A boolean attribute has an empty value.
+    pub attrs: Attributes<'a>,
+    /// Whether the element spans more than the paragraph that opened it
+    /// (Comark's `$.block`).
+    pub block: bool,
+    /// The content: blocks and inlines, in source order.
+    pub children: Vec<Node<'a>>,
+}
+
+/// The content of an [`HtmlElement`], which can mix blocks and inlines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Node<'a> {
+    /// A block.
+    Block(Block<'a>),
+    /// An inline.
+    Inline(Inline<'a>),
 }
 
 /// A paragraph.
@@ -217,6 +249,41 @@ impl<'a> Attributes<'a> {
             Some(a) => a.value = value,
             None => self.0.push(Attribute { name, value }),
         }
+    }
+
+    /// Builds attributes from a list that may repeat names: a repeated name
+    /// keeps its first position and takes the last value, or, with
+    /// `join_class`, a repeated `class` adds its classes. Linear in the
+    /// number of attributes.
+    pub(crate) fn from_list(list: Vec<Attribute<'a>>, join_class: bool) -> Self {
+        let mut out: Vec<Attribute<'a>> = Vec::with_capacity(list.len());
+        let mut index: std::collections::HashMap<Cow<'a, str>, usize> =
+            std::collections::HashMap::new();
+        for a in list {
+            let found = if out.len() < 8 {
+                out.iter().position(|o| o.name == a.name)
+            } else {
+                if index.is_empty() {
+                    index.extend(out.iter().enumerate().map(|(i, o)| (o.name.clone(), i)));
+                }
+                index.get(&a.name).copied()
+            };
+            match found {
+                Some(i) if join_class && a.name == "class" => {
+                    let v = out[i].value.to_mut();
+                    v.push(' ');
+                    v.push_str(&a.value);
+                }
+                Some(i) => out[i].value = a.value,
+                None => {
+                    if !index.is_empty() {
+                        index.insert(a.name.clone(), out.len());
+                    }
+                    out.push(a);
+                }
+            }
+        }
+        Attributes(out)
     }
 
     /// Adds every attribute of `other`, like [`set`](Self::set).
@@ -368,6 +435,13 @@ pub enum Inline<'a> {
     Image(Link<'a>),
     /// A reference to a footnote.
     FootnoteReference(FootnoteReference<'a>),
+    /// An HTML element inside inline content, when
+    /// [`Options::html`](crate::Options::html) is enabled.
+    HtmlElement(Box<HtmlElement<'a>>),
+    /// An HTML comment, a processing instruction or a declaration inside
+    /// inline content, when [`Options::html`](crate::Options::html) is
+    /// enabled. Holds the text between `<!--` and `-->`, or the whole tag.
+    HtmlComment(Cow<'a, str>),
 }
 
 /// An inline element with attributes and inline content.
@@ -507,6 +581,8 @@ impl Block<'_> {
                     .map(|r| r.into_iter().map(inlines_owned).collect())
                     .collect(),
             }),
+            Block::HtmlElement(e) => Block::HtmlElement(e.into_owned()),
+            Block::HtmlComment(c) => Block::HtmlComment(cow_owned!(c)),
             Block::Component(c) => Block::Component(Component {
                 name: cow_owned!(c.name),
                 attrs: c.attrs.into_owned(),
@@ -548,6 +624,8 @@ impl Inline<'_> {
             }),
             Inline::Link(l) => Inline::Link(l.into_owned()),
             Inline::Image(l) => Inline::Image(l.into_owned()),
+            Inline::HtmlElement(e) => Inline::HtmlElement(Box::new(e.into_owned())),
+            Inline::HtmlComment(c) => Inline::HtmlComment(cow_owned!(c)),
             Inline::FootnoteReference(r) => Inline::FootnoteReference(FootnoteReference {
                 label: cow_owned!(r.label),
                 index: r.index,
@@ -576,6 +654,25 @@ impl Link<'_> {
             kind: self.kind,
             attrs: self.attrs.into_owned(),
             children: inlines_owned(self.children),
+        }
+    }
+}
+
+impl HtmlElement<'_> {
+    /// Detaches the element from its source by copying every borrowed text.
+    pub fn into_owned(self) -> HtmlElement<'static> {
+        HtmlElement {
+            tag: cow_owned!(self.tag),
+            attrs: self.attrs.into_owned(),
+            block: self.block,
+            children: self
+                .children
+                .into_iter()
+                .map(|n| match n {
+                    Node::Block(b) => Node::Block(b.into_owned()),
+                    Node::Inline(i) => Node::Inline(i.into_owned()),
+                })
+                .collect(),
         }
     }
 }

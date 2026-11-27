@@ -6,21 +6,34 @@ fn html(md: &str) -> String {
     to_html(md)
 }
 
+/// Raw HTML kept as written, rendered by `HtmlOptions::raw_html`.
+fn raw(md: &str, opts: &HtmlOptions) -> String {
+    let options = Options {
+        html: false,
+        ..Options::default()
+    };
+    to_html_with(md, &options, opts)
+}
+
 #[test]
-fn raw_html_is_escaped_by_default() {
+fn raw_html_is_escaped_without_html_elements() {
+    let opts = HtmlOptions::default();
     assert_eq!(
-        html("<script>alert(1)</script>"),
+        raw("<script>alert(1)</script>", &opts),
         "&lt;script&gt;alert(1)&lt;/script&gt;\n"
     );
     assert_eq!(
-        html("a <img src=x onerror=alert(1)> b"),
+        raw("a <img src=x onerror=alert(1)> b", &opts),
         "<p>a &lt;img src=x onerror=alert(1)&gt; b</p>\n"
     );
     assert_eq!(
-        html("<div onclick=\"alert(1)\">\n\n*x*\n\n</div>"),
+        raw("<div onclick=\"alert(1)\">\n\n*x*\n\n</div>", &opts),
         "&lt;div onclick=\"alert(1)\"&gt;\n<p><em>x</em></p>\n&lt;/div&gt;\n"
     );
-    assert_eq!(html("<!-- <script> -->"), "&lt;!-- &lt;script&gt; --&gt;\n");
+    assert_eq!(
+        raw("<!-- <script> -->", &opts),
+        "&lt;!-- &lt;script&gt; --&gt;\n"
+    );
 }
 
 #[test]
@@ -30,7 +43,7 @@ fn raw_html_can_be_omitted() {
         ..HtmlOptions::default()
     };
     assert_eq!(
-        to_html_with("a <b>c</b>\n\n<div>x</div>", &Options::default(), &opts),
+        raw("a <b>c</b>\n\n<div>x</div>", &opts),
         "<p>a <!-- raw HTML omitted -->c<!-- raw HTML omitted --></p>\n<!-- raw HTML omitted -->\n"
     );
 }
@@ -42,12 +55,127 @@ fn allowed_raw_html_keeps_the_tag_filter() {
         ..HtmlOptions::default()
     };
     assert_eq!(
-        to_html_with(
-            "<b>ok</b> <script>x</script> <IFRAME src=y>",
-            &Options::default(),
-            &opts
-        ),
+        raw("<b>ok</b> <script>x</script> <IFRAME src=y>", &opts),
         "<p><b>ok</b> &lt;script>x&lt;/script> &lt;IFRAME src=y></p>\n"
+    );
+}
+
+#[test]
+fn html_elements_are_parsed_like_comark() {
+    assert_eq!(
+        html("<div>\nHello **World**\n</div>"),
+        "<div>Hello <strong>World</strong></div>\n"
+    );
+    assert_eq!(html("a <b>x</b> c"), "<p>a <b>x</b> c</p>\n");
+    assert_eq!(html("<!-- c --> x"), "<p><!-- c --> x</p>\n");
+    assert_eq!(
+        html("<details>\n<summary>S</summary>\n\n- a\n\n</details>"),
+        "<details><summary>S</summary>\n<ul>\n<li>a</li>\n</ul>\n</details>\n"
+    );
+}
+
+#[test]
+fn html_attributes_are_sanitized() {
+    for (md, expected) in [
+        ("<a href=\"javascript:alert(1)\">x</a>", "<a>x</a>\n"),
+        ("<A HREF=\"JAVASCRIPT:alert(1)\">x</A>", "<a>x</a>\n"),
+        ("<a href=\" javascript:alert(1)\">x</a>", "<a>x</a>\n"),
+        ("<a href=\"&#106;avascript:alert(1)\">x</a>", "<a>x</a>\n"),
+        ("<a href=\"jav&#x09;ascript:alert(1)\">x</a>", "<a>x</a>\n"),
+        ("<a href=\"javascript&colon;alert(1)\">x</a>", "<a>x</a>\n"),
+        (
+            "<a href=\"data:text/html,<script>alert(1)</script>\">x</a>",
+            "<a>x</a>\n",
+        ),
+        ("<img src=x onerror=alert(1)>", "<img src=\"x\">\n"),
+        (
+            "<img srcset=\"javascript:alert(1) 1x\" src=ok.png>",
+            "<img src=\"ok.png\">\n",
+        ),
+        ("<input autofocus onfocus=alert(1)>", "<input autofocus>\n"),
+        (
+            "<details open ontoggle=alert(1)>x</details>",
+            "<details open>x</details>\n",
+        ),
+        (
+            "<svg onload=alert(1)><circle r=1></circle></svg>",
+            "<svg><circle r=\"1\"></circle></svg>\n",
+        ),
+        (
+            "<svg><a xlink:href=\"javascript:alert(1)\"><text>x</text></a></svg>",
+            "<svg><a><text>x</text></a></svg>\n",
+        ),
+        (
+            "<form action=\"javascript:x\"><button formaction=\"javascript:y\">b</button></form>",
+            "<form><button>b</button></form>\n",
+        ),
+        (
+            "<div style=\"background:url(javascript:alert(1))\">x</div>",
+            "<div>x</div>\n",
+        ),
+        (
+            "<x-foo onclick=alert(1) v-html=x :innerHTML=y>z</x-foo>",
+            "<x-foo>z</x-foo>\n",
+        ),
+        (
+            "<a href=\"https://ok.com\" target=_blank>ok</a>",
+            "<a href=\"https://ok.com\" target=\"_blank\">ok</a>\n",
+        ),
+    ] {
+        assert_eq!(html(md), expected, "{md}");
+    }
+}
+
+#[test]
+fn dangerous_html_elements_are_dropped() {
+    for md in [
+        "<script>alert(1)</script>",
+        "<SCRIPT>alert(1)</SCRIPT>",
+        "<svg><script>alert(1)</script></svg>",
+        "<style>body{display:none}</style>",
+        "<iframe src=\"https://evil.example\"></iframe>",
+        "<object data=x></object><embed src=x>",
+        "<meta http-equiv=\"refresh\" content=\"0;url=javascript:x\">",
+        "<base href=\"https://evil.example/\">",
+        "<link rel=stylesheet href=x>",
+        "<textarea><script>x</script></textarea>",
+        "<noscript><p title=\"</noscript><img src=x onerror=alert(1)>\">",
+        "<math><mtext><table><mglyph><style><img src=x onerror=alert(1)>",
+        "<div is=\"script\">x</div>",
+        "<span as=\"iframe\">x</span>",
+    ] {
+        let out = html(md);
+        for bad in [
+            "script", "style", "iframe", "object", "embed", "meta", "base", "link", "onerror",
+            "noscript",
+        ] {
+            assert!(!out.to_ascii_lowercase().contains(bad), "{md} gave {out}");
+        }
+    }
+}
+
+#[test]
+fn html_comments_cannot_end_early() {
+    // Browsers also end a comment at `--!>`.
+    assert_eq!(
+        html("<!-- a --!> <img src=x onerror=alert(1)> -->"),
+        "<!-- a --!&gt; <img src=x onerror=alert(1)&gt; -->\n"
+    );
+    assert_eq!(
+        html("<![CDATA[ x ]]> <?php x ?>"),
+        "<p><!--<![CDATA[ x ]]&gt;--> <!--<?php x ?&gt;--></p>\n"
+    );
+}
+
+#[test]
+fn trusted_mode_keeps_html_elements() {
+    assert_eq!(
+        to_html_with(
+            "<a href=\"javascript:b\" onclick=\"c\">x</a> <script>d</script>",
+            &Options::default(),
+            &HtmlOptions::trusted()
+        ),
+        "<p><a href=\"javascript:b\" onclick=\"c\">x</a> <script>d</script></p>\n"
     );
 }
 

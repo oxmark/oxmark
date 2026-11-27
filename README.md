@@ -5,8 +5,8 @@ A fast Rust implementation of Comark (Markdown with components).
 > **Status:** early development. The parser passes the whole
 > [CommonMark 0.31.2](https://spec.commonmark.org/0.31.2/) test suite
 > (652/652 examples), the [GFM](https://github.github.com/gfm/) extension
-> examples, and 234 of Comark's 260 runnable SPEC examples. The others need raw
-> HTML parsed into elements, which comes next.
+> examples, and 259 of Comark's 260 runnable SPEC examples (the last one is a
+> deliberate difference, see below).
 
 ## Features
 
@@ -23,6 +23,8 @@ A fast Rust implementation of Comark (Markdown with components).
     inline elements, paragraphs, headings and list items;
   - YAML frontmatter, with `:attr="frontmatter.key"` bindings;
   - GFM alerts (`> [!NOTE]`);
+  - raw HTML parsed into elements, with the Markdown between tags parsed too
+    (`<div>\n**bold**\n</div>`), and tags left open closed at the end;
   - heading ids (flat or nested) and footnotes (opt-in), with the same slugs
     and markup as Comark.
 - A typed syntax tree ([`oxmark::ast`](src/ast.rs)) that borrows text from the
@@ -86,11 +88,9 @@ reference links (`[label]` alone) are only links when components are off.
 
 Differences with Comark, on purpose:
 
-- Raw HTML is escaped by default; Comark parses it into elements (see
-  [Security](#security)).
-- Components that can run code or load content (`script`, `iframe`, `style`,
-  `object`, ...) are dropped with their content, even when Comark's security
-  plugin would keep them.
+- Components and HTML elements that can run code or load content (`script`,
+  `iframe`, `style`, `object`, ...) are dropped with their content, even when
+  Comark's security plugin would keep them (see [Security](#security)).
 - In text, `&` is escaped wherever a browser could read a character
   reference, so `\&amp;` shows `&amp;` as written.
 - Footnote definitions hold inline Markdown (Comark keeps them as plain text),
@@ -103,15 +103,15 @@ The default `HtmlOptions` are meant for untrusted input:
 
 | Threat | Default behavior |
 | --- | --- |
-| Raw HTML (`<script>`, `<img onerror=...>`, HTML blocks) | Escaped and shown as text (`RawHtml::Escape`). `RawHtml::Omit` drops it instead. |
+| Raw HTML (`<script>`, `<img onerror=...>`, HTML blocks) | Parsed into elements, like in Comark (`Options::html`), then rendered with the rules below: `<img src=x onerror=alert(1)>` gives `<img src="x">`. A `>` inside an HTML comment is escaped, so `--!>` cannot end it early. With `Options::html` off, raw HTML is escaped and shown as text (`RawHtml::Escape`), or dropped (`RawHtml::Omit`). |
 | Dangerous URL schemes | `javascript:`, `vbscript:`, `file:` and `data:` URLs become an empty `href`/`src`. `data:image/{png,gif,jpeg,webp}` stays allowed for images. The check decodes entities and ignores case, leading control characters, tabs and line breaks, like browsers do. |
 | Attribute injection | URLs are percent-encoded; titles, alt text, info strings and all text are HTML-escaped. |
-| Component and attribute props | Comark's security rules, on by default (`sanitize`): event handlers (`onclick`, `@click`, `:onClick`), `*html` props (`v-html`, `innerHTML`), `srcdoc`, `formaction`, unsafe URLs in `href`, `src`, `srcset`, `action`, `poster`, ... and `style` with `javascript:`, `expression(` or `url(data:text` are dropped. Values are checked as the browser reads them, with character references and JSON bindings decoded. |
-| Dangerous components | `script`, `style`, `iframe`, `object`, `embed`, `base`, `meta`, `link`, `textarea`, `title`, `noscript`, `xmp` and other such tags are dropped with their content, also through `as` or `is`; an `object` never gets attributes. |
+| Attributes of components, HTML elements and `{...}` lists | Comark's security rules, on by default (`sanitize`): event handlers (`onclick`, `@click`, `:onClick`), `*html` props (`v-html`, `innerHTML`), `srcdoc`, `formaction`, unsafe URLs in `href`, `src`, `srcset`, `action`, `poster`, ... and `style` with `javascript:`, `expression(` or `url(data:text` are dropped. Values are checked as the browser reads them, with character references and JSON bindings decoded. |
+| Dangerous components and HTML elements | `script`, `style`, `iframe`, `object`, `embed`, `base`, `meta`, `link`, `textarea`, `title`, `noscript`, `xmp` and other such tags are dropped with their content, also through `as` or `is`; an `object` never gets attributes. |
 | `U+0000` | Replaced by `U+FFFD`, as the spec requires. |
-| Denial of service | Pathological inputs (see `tests/pathological.rs`), including unclosed components, spans, attribute lists and props, run in linear time; container and inline nesting are capped at 100 levels; YAML nesting is capped; table auto-completion is capped. |
+| Denial of service | Pathological inputs (see `tests/pathological.rs`), including unclosed components, spans, attribute lists, props and HTML tags, run in linear time; container and inline nesting are capped at 100 levels, open HTML tags at 64; YAML nesting is capped; table auto-completion is capped. |
 
-`RawHtml::Allow` passes raw HTML through. It keeps the GFM tag filter
+With `Options::html` off, `RawHtml::Allow` passes raw HTML through. It keeps the GFM tag filter
 (`<script>`, `<style>`, `<iframe>`, ... are neutralized) unless `tagfilter` is
 turned off, but it is not a sanitizer: only use it with trusted input or
 sanitize the output. `HtmlOptions::trusted()` turns every protection off;

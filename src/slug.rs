@@ -111,7 +111,17 @@ pub(crate) fn plain_text(inlines: &[Inline<'_>], out: &mut String) {
             | Inline::Span(e) => plain_text(&e.children, out),
             Inline::Component(c) => plain_text(&c.children, out),
             Inline::Link(l) => plain_text(&l.children, out),
-            Inline::Image(_) | Inline::Html(_) | Inline::FootnoteReference(_) => {}
+            Inline::HtmlElement(e) => {
+                for node in &e.children {
+                    if let crate::ast::Node::Inline(i) = node {
+                        plain_text(std::slice::from_ref(i), out);
+                    }
+                }
+            }
+            Inline::Image(_)
+            | Inline::Html(_)
+            | Inline::HtmlComment(_)
+            | Inline::FootnoteReference(_) => {}
         }
     }
 }
