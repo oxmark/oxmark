@@ -98,6 +98,8 @@ enum Kind<'a> {
     Strikethrough,
     Link(Box<(Cow<'a, str>, Cow<'a, str>, LinkKind)>),
     Image(Box<(Cow<'a, str>, Cow<'a, str>)>),
+    /// A footnote reference; its children are the label text, dropped.
+    FootnoteRef(Cow<'a, str>, u32, u32),
     /// A container that would nest too deeply; its children are spliced
     /// into its parent when building the tree.
     Group,
@@ -155,6 +157,7 @@ struct Parser<'a, 's, 'r> {
     b: &'s [u8],
     pos: usize,
     refs: &'r RefMap<'a>,
+    footnotes: Footnotes<'a>,
     opts: &'r Options,
     nodes: Vec<Node<'a>>,
     delims: Vec<Delim>,
@@ -184,12 +187,14 @@ pub(crate) fn parse<'a>(
     delims.clear();
     let mut brackets = std::mem::take(&mut scratch.brackets);
     brackets.clear();
+    let footnotes = std::mem::take(&mut scratch.footnotes);
     let mut p = Parser {
         src,
         subject,
         b: subject.as_bytes(),
         pos: 0,
         refs,
+        footnotes,
         opts,
         nodes,
         delims,
@@ -215,15 +220,72 @@ pub(crate) fn parse<'a>(
     scratch.nodes = p.nodes;
     scratch.delims = p.delims;
     scratch.brackets = p.brackets;
+    scratch.footnotes = p.footnotes;
     out
 }
 
-/// Buffers kept between inline parses to avoid reallocating them.
+/// State kept between the inline parses of a document: reused buffers and
+/// footnote numbering.
 #[derive(Default)]
 pub(crate) struct Scratch<'a> {
     nodes: Vec<Node<'a>>,
     delims: Vec<Delim>,
     brackets: Vec<Bracket>,
+    pub(crate) footnotes: Footnotes<'a>,
+}
+
+/// Footnote definitions and the order in which they are referenced.
+#[derive(Default)]
+pub(crate) struct Footnotes<'a> {
+    /// Content of each definition, by label.
+    pub(crate) defs: HashMap<String, Cow<'a, str>>,
+    /// Referenced labels in order, with their reference count.
+    pub(crate) used: Vec<(Cow<'a, str>, u32)>,
+    /// Position of each referenced label in `used`.
+    index: HashMap<String, usize>,
+}
+
+impl<'a> Footnotes<'a> {
+    /// Records a reference. Returns `(index, occurrence)`, both from 1.
+    fn reference(&mut self, label: Cow<'a, str>) -> (u32, u32) {
+        let pos = match self.index.get(label.as_ref()) {
+            Some(&p) => p,
+            None => {
+                self.index.insert(label.to_string(), self.used.len());
+                self.used.push((label, 0));
+                self.used.len() - 1
+            }
+        };
+        self.used[pos].1 += 1;
+        (pos as u32 + 1, self.used[pos].1)
+    }
+}
+
+/// Parses a single-line footnote definition `[^label]: text` at the start of
+/// `text`. Returns the number of bytes consumed, or 0.
+pub(crate) fn parse_footnote_def<'a>(
+    src: &'a str,
+    text: &str,
+    defs: &mut HashMap<String, Cow<'a, str>>,
+) -> usize {
+    let b = text.as_bytes();
+    if !text.starts_with("[^") {
+        return 0;
+    }
+    let mut i = 2;
+    while i < b.len() && !matches!(b[i], b']' | b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    if i == 2 || !text[i..].starts_with("]:") {
+        return 0;
+    }
+    let label = &text[2..i];
+    let start = i + 2;
+    let end = text[start..].find('\n').map_or(b.len(), |p| start + p);
+    let content = text[start..end].trim_matches([' ', '\t']);
+    // Like Comark, a later definition replaces an earlier one.
+    defs.insert(label.to_owned(), to_cow(src, content));
+    (end + 1).min(b.len())
 }
 
 impl<'a, 's, 'r> Parser<'a, 's, 'r> {
@@ -718,6 +780,9 @@ impl<'a, 's, 'r> Parser<'a, 's, 'r> {
                 self.pos = end;
             }
         }
+        if target.is_none() && self.opts.footnotes && !image && self.footnote_ref(start) {
+            return true;
+        }
         if target.is_none() {
             let opener = self.brackets.last().unwrap();
             let label = match scan::link_label(self.b, start) {
@@ -761,6 +826,33 @@ impl<'a, 's, 'r> Parser<'a, 's, 'r> {
                 }
             }
         }
+        true
+    }
+
+    /// Tries a footnote reference `[^label]` ending just before `start`.
+    fn footnote_ref(&mut self, start: usize) -> bool {
+        let opener = self.brackets.last().unwrap();
+        let inner = &self.subject[opener.index + 1..start - 1];
+        let Some(label) = inner.strip_prefix('^') else {
+            return false;
+        };
+        if label.is_empty()
+            || label
+                .bytes()
+                .any(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'[' | b']'))
+            || !self.footnotes.defs.contains_key(label)
+        {
+            return false;
+        }
+        let label = to_cow(self.src, label);
+        let (index, occurrence) = self.footnotes.reference(label.clone());
+        let opener = self.brackets.pop().unwrap();
+        let node = self.new_node(Kind::FootnoteRef(label, index, occurrence));
+        self.adopt_following(opener.node, NONE, node);
+        self.append_child(0, node);
+        self.process_emphasis(opener.prev_delim);
+        self.unlink(opener.node);
+        self.pos = start;
         true
     }
 
@@ -850,6 +942,13 @@ impl<'a, 's, 'r> Parser<'a, 's, 'r> {
                 Kind::Emphasis => Inline::Emphasis(self.build(c, in_link)),
                 Kind::Strong => Inline::Strong(self.build(c, in_link)),
                 Kind::Strikethrough => Inline::Strikethrough(self.build(c, in_link)),
+                Kind::FootnoteRef(label, index, occurrence) => {
+                    Inline::FootnoteReference(crate::ast::FootnoteReference {
+                        label,
+                        index,
+                        occurrence,
+                    })
+                }
                 Kind::Link(link) => Inline::Link(Link {
                     url: link.0,
                     title: link.1,

@@ -67,6 +67,15 @@ fn links() {
         &format!("{}\n{}", rep("[a]: /b\n", 20000), rep("[a] ", 20000)),
     );
     check("long label", &format!("[{}]", rep("a", 100000)));
+    let options = oxmark::Options {
+        footnotes: true,
+        ..oxmark::Options::default()
+    };
+    let input = format!("{}\n\n{}", rep("x[^a] [^b", 20000), rep("[^a]: n\n", 20000));
+    let start = Instant::now();
+    oxmark::to_html_with(&input, &options, &oxmark::HtmlOptions::default());
+    assert!(start.elapsed() < Duration::from_secs(10), "footnotes");
+    check("many headings", &rep("# Title\n", 20000));
 }
 
 #[test]

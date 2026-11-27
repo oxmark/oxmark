@@ -2,7 +2,8 @@
 //!
 //! The parser currently implements [CommonMark 0.31.2] and the
 //! [GitHub Flavored Markdown] extensions (tables, strikethrough, task lists
-//! and extended autolinks). Comark components come next.
+//! and extended autolinks), plus Comark's heading ids and footnotes. Comark
+//! components come next.
 //!
 //! ```
 //! let html = oxmark::to_html("Hello *world* <script>alert(1)</script>");
@@ -31,6 +32,7 @@ mod block;
 mod html;
 mod inline;
 mod scan;
+mod slug;
 mod tables;
 mod text;
 
@@ -51,12 +53,22 @@ pub struct Options {
     /// GFM extended autolinks (`www.example.com`, `https://example.com`,
     /// `user@example.com` without angle brackets).
     pub autolinks: bool,
+    /// Heading ids computed from the heading text, like Comark does
+    /// (`## Hello World` gets `id="hello-world"`, repeats get `-1`, `-2`...).
+    pub heading_ids: bool,
+    /// Footnotes: `[^label]` references and single-line `[^label]: text`
+    /// definitions, rendered like Comark's footnotes plugin.
+    pub footnotes: bool,
 }
 
 impl Default for Options {
-    /// Every GFM extension enabled.
+    /// The Comark defaults: every GFM extension and heading ids. Footnotes
+    /// are off, as in Comark where they come from an optional plugin.
     fn default() -> Self {
-        Options::gfm()
+        Options {
+            heading_ids: true,
+            ..Options::gfm()
+        }
     }
 }
 
@@ -68,21 +80,26 @@ impl Options {
             strikethrough: false,
             tasklists: false,
             autolinks: false,
+            heading_ids: false,
+            footnotes: false,
         }
     }
 
-    /// CommonMark with every GFM extension.
+    /// CommonMark with every GFM extension, without heading ids or
+    /// footnotes.
     pub const fn gfm() -> Self {
         Options {
             tables: true,
             strikethrough: true,
             tasklists: true,
             autolinks: true,
+            heading_ids: false,
+            footnotes: false,
         }
     }
 }
 
-/// Parses Markdown with the default options (GFM).
+/// Parses Markdown with the default options (GFM and heading ids).
 pub fn parse(input: &str) -> Document<'_> {
     parse_with(input, &Options::default())
 }
@@ -111,3 +128,7 @@ pub fn to_html_with(input: &str, options: &Options, html: &HtmlOptions) -> Strin
     render_html_to(&doc, html, &mut out);
     out
 }
+
+#[doc = include_str!("../README.md")]
+#[cfg(doctest)]
+struct ReadmeDoctests;

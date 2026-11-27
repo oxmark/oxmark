@@ -16,6 +16,34 @@ use std::borrow::Cow;
 pub struct Document<'a> {
     /// Top-level blocks, in source order.
     pub children: Vec<Block<'a>>,
+    /// Footnotes that are referenced, in the order of their first reference.
+    /// Always empty unless [`Options::footnotes`](crate::Options::footnotes)
+    /// is enabled.
+    pub footnotes: Vec<Footnote<'a>>,
+}
+
+/// A footnote definition (`[^label]: text`) that is referenced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Footnote<'a> {
+    /// The label, as written.
+    pub label: Cow<'a, str>,
+    /// The footnote number, starting at 1.
+    pub index: u32,
+    /// How many times the footnote is referenced.
+    pub references: u32,
+    /// The content of the definition.
+    pub children: Vec<Inline<'a>>,
+}
+
+/// A reference to a footnote (`[^label]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FootnoteReference<'a> {
+    /// The label, as written.
+    pub label: Cow<'a, str>,
+    /// The footnote number, starting at 1.
+    pub index: u32,
+    /// Which reference to this footnote this is, starting at 1.
+    pub occurrence: u32,
 }
 
 /// A block-level element.
@@ -45,6 +73,10 @@ pub enum Block<'a> {
 pub struct Heading<'a> {
     /// Level from 1 to 6.
     pub level: u8,
+    /// The id computed from the text, when
+    /// [`Options::heading_ids`](crate::Options::heading_ids) is enabled and
+    /// the text gives a non-empty id.
+    pub id: Option<String>,
     /// Inline content.
     pub children: Vec<Inline<'a>>,
 }
@@ -154,6 +186,8 @@ pub enum Inline<'a> {
     Link(Link<'a>),
     /// An image; its children are the alternative text.
     Image(Link<'a>),
+    /// A reference to a footnote.
+    FootnoteReference(FootnoteReference<'a>),
 }
 
 /// The target and content of a link or an image.
@@ -192,6 +226,16 @@ impl Document<'_> {
     pub fn into_owned(self) -> Document<'static> {
         Document {
             children: blocks_owned(self.children),
+            footnotes: self
+                .footnotes
+                .into_iter()
+                .map(|f| Footnote {
+                    label: cow_owned!(f.label),
+                    index: f.index,
+                    references: f.references,
+                    children: inlines_owned(f.children),
+                })
+                .collect(),
         }
     }
 }
@@ -211,6 +255,7 @@ impl Block<'_> {
             Block::Paragraph(c) => Block::Paragraph(inlines_owned(c)),
             Block::Heading(h) => Block::Heading(Heading {
                 level: h.level,
+                id: h.id,
                 children: inlines_owned(h.children),
             }),
             Block::ThematicBreak => Block::ThematicBreak,
@@ -260,6 +305,11 @@ impl Inline<'_> {
             Inline::Strikethrough(c) => Inline::Strikethrough(inlines_owned(c)),
             Inline::Link(l) => Inline::Link(l.into_owned()),
             Inline::Image(l) => Inline::Image(l.into_owned()),
+            Inline::FootnoteReference(r) => Inline::FootnoteReference(FootnoteReference {
+                label: cow_owned!(r.label),
+                index: r.index,
+                occurrence: r.occurrence,
+            }),
         }
     }
 }

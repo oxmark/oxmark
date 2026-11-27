@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 use crate::tables::{ENTITIES, PUNCTUATION, WHITESPACE};
 
-fn in_ranges(table: &[(u32, u32)], c: char) -> bool {
+pub(crate) fn in_ranges(table: &[(u32, u32)], c: char) -> bool {
     let c = c as u32;
     table
         .binary_search_by(|&(lo, hi)| {

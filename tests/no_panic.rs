@@ -37,6 +37,11 @@ fn random_inputs_do_not_panic() {
             .collect();
         let result = std::panic::catch_unwind(|| {
             let _ = oxmark::to_html(&input);
+            let all = oxmark::Options {
+                footnotes: true,
+                ..oxmark::Options::default()
+            };
+            let _ = oxmark::to_html_with(&input, &all, &oxmark::HtmlOptions::default());
             let _ = oxmark::to_html_with(
                 &input,
                 &oxmark::Options::commonmark(),

@@ -1,6 +1,6 @@
 //! HTML rendering, with sanitizing of raw HTML and URLs.
 
-use crate::ast::{Alignment, Block, CodeBlock, Document, Inline, Link, List, ListKind};
+use crate::ast::{Alignment, Block, CodeBlock, Document, Footnote, Inline, Link, List, ListKind};
 
 /// What to do with raw HTML (HTML blocks and inline tags) when rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -64,6 +64,9 @@ pub fn render_html(doc: &Document<'_>, options: &HtmlOptions) -> String {
 pub fn render_html_to(doc: &Document<'_>, options: &HtmlOptions, out: &mut String) {
     let mut r = Renderer { out, opts: options };
     r.blocks(&doc.children, false);
+    if !doc.footnotes.is_empty() {
+        r.footnotes(&doc.footnotes);
+    }
 }
 
 struct Renderer<'o, 'w> {
@@ -107,6 +110,11 @@ impl Renderer<'_, '_> {
                 self.cr();
                 self.push("<h");
                 self.out.push(level);
+                if let Some(id) = &h.id {
+                    self.push(" id=\"");
+                    escape_html(self.out, id);
+                    self.push("\"");
+                }
                 self.push(">");
                 self.inlines(&h.children);
                 self.push("</h");
@@ -152,6 +160,22 @@ impl Renderer<'_, '_> {
                 self.push("</table>\n");
             }
         }
+    }
+
+    /// The footnote section, with the markup of Comark's footnotes plugin.
+    fn footnotes(&mut self, footnotes: &[Footnote<'_>]) {
+        self.cr();
+        self.push("<section class=\"footnotes\">\n<hr />\n<h2 id=\"footnotes\">Footnotes</h2>\n<ol class=\"footnotes-list\">\n");
+        for f in footnotes {
+            self.push("<li id=\"fn-");
+            footnote_id(self.out, &f.label);
+            self.push("\">");
+            self.inlines(&f.children);
+            self.push(" <a href=\"#fnref-");
+            footnote_id(self.out, &f.label);
+            self.push("\" class=\"footnote-backref\">\u{21A9}</a></li>\n");
+        }
+        self.push("</ol>\n</section>\n");
     }
 
     fn cell(&mut self, tag: &str, align: Alignment, content: &[Inline<'_>]) {
@@ -268,6 +292,19 @@ impl Renderer<'_, '_> {
                 self.inlines(&link.children);
                 self.push("</a>");
             }
+            Inline::FootnoteReference(r) => {
+                self.push("<sup class=\"footnote-ref\"><a href=\"#fn-");
+                footnote_id(self.out, &r.label);
+                self.push("\" id=\"fnref-");
+                footnote_id(self.out, &r.label);
+                if r.occurrence > 1 {
+                    self.push("-");
+                    self.push(itoa(r.occurrence, &mut [0; 10]));
+                }
+                self.push("\">[");
+                self.push(itoa(r.index, &mut [0; 10]));
+                self.push("]</a></sup>");
+            }
             Inline::Image(link) => {
                 self.push("<img src=\"");
                 self.url(&link.url, true);
@@ -302,6 +339,25 @@ fn alt_text(out: &mut String, inlines: &[Inline<'_>]) {
             Inline::SoftBreak | Inline::HardBreak => out.push('\n'),
             Inline::Emphasis(c) | Inline::Strong(c) | Inline::Strikethrough(c) => alt_text(out, c),
             Inline::Link(l) | Inline::Image(l) => alt_text(out, &l.children),
+            Inline::FootnoteReference(r) => {
+                out.push('[');
+                out.push_str(itoa(r.index, &mut [0; 10]));
+                out.push(']');
+            }
+        }
+    }
+}
+
+/// Writes a footnote label as an id, like Comark: characters other than
+/// ASCII alphanumerics, `_` and `-` become `-<hex code>-`.
+fn footnote_id(out: &mut String, label: &str) {
+    for c in label.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            out.push(c);
+        } else {
+            out.push('-');
+            out.push_str(&format!("{:x}", c as u32));
+            out.push('-');
         }
     }
 }

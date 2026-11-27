@@ -8,9 +8,11 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use crate::ast::{self, Alignment, Block, Inline};
 use crate::inline::{self, RefMap};
+use crate::slug::HeadingIds;
 use crate::text::{is_space_or_tab, unescape};
 use crate::Options;
 
@@ -233,6 +235,8 @@ pub(crate) struct BlockParser<'a, 'o> {
     line_consumed: bool,
     /// Buffers reused by every inline parse.
     scratch: RefCell<inline::Scratch<'a>>,
+    footnote_defs: HashMap<String, Cow<'a, str>>,
+    heading_ids: RefCell<HeadingIds>,
 }
 
 impl<'a, 'o> BlockParser<'a, 'o> {
@@ -270,6 +274,8 @@ impl<'a, 'o> BlockParser<'a, 'o> {
             partially_consumed_tab: false,
             line_consumed: false,
             scratch: RefCell::default(),
+            footnote_defs: HashMap::new(),
+            heading_ids: RefCell::default(),
         }
     }
 
@@ -298,8 +304,13 @@ impl<'a, 'o> BlockParser<'a, 'o> {
         while self.tip != NONE {
             self.finalize(self.tip, self.line_number);
         }
+        self.scratch.get_mut().footnotes.defs = std::mem::take(&mut self.footnote_defs);
         let children = self.convert_children(0);
-        ast::Document { children }
+        let footnotes = self.convert_footnotes();
+        ast::Document {
+            children,
+            footnotes,
+        }
     }
 
     // ----- line state -----
@@ -493,7 +504,13 @@ impl<'a, 'o> BlockParser<'a, 'o> {
             if !text.starts_with('[') {
                 break;
             }
-            let n = inline::parse_reference(self.src, text, &mut self.refs);
+            let mut n = 0;
+            if self.opts.footnotes {
+                n = inline::parse_footnote_def(self.src, text, &mut self.footnote_defs);
+            }
+            if n == 0 {
+                n = inline::parse_reference(self.src, text, &mut self.refs);
+            }
             if n == 0 {
                 break;
             }
@@ -1000,6 +1017,38 @@ impl<'a, 'o> BlockParser<'a, 'o> {
 
     // ----- conversion to the public tree -----
 
+    /// Parses the referenced footnote definitions, including the ones only
+    /// referenced from other footnotes.
+    fn convert_footnotes(&self) -> Vec<ast::Footnote<'a>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        loop {
+            let (label, content) = {
+                let scratch = self.scratch.borrow();
+                let Some((label, _)) = scratch.footnotes.used.get(i) else {
+                    break;
+                };
+                (
+                    label.clone(),
+                    scratch.footnotes.defs[label.as_ref()].clone(),
+                )
+            };
+            let children = self.inlines(&content);
+            out.push(ast::Footnote {
+                label,
+                index: i as u32 + 1,
+                references: 0,
+                children,
+            });
+            i += 1;
+        }
+        let scratch = self.scratch.borrow();
+        for (f, (_, count)) in out.iter_mut().zip(&scratch.footnotes.used) {
+            f.references = *count;
+        }
+        out
+    }
+
     fn convert_children(&self, idx: usize) -> Vec<Block<'a>> {
         self.nodes[idx]
             .children
@@ -1028,9 +1077,16 @@ impl<'a, 'o> BlockParser<'a, 'o> {
             }
             Kind::Heading(level) => {
                 let text = node.content.text(src).trim_matches(is_ascii_ws_char);
+                let children = self.inlines(text);
+                let id = if self.opts.heading_ids {
+                    self.heading_ids.borrow_mut().next(&children)
+                } else {
+                    None
+                };
                 Block::Heading(ast::Heading {
                     level: *level,
-                    children: self.inlines(text),
+                    id,
+                    children,
                 })
             }
             Kind::ThematicBreak => Block::ThematicBreak,

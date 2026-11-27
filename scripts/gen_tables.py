@@ -51,6 +51,17 @@ emit_ranges(
     ranges(lambda c: unicodedata.category(c) == "Zs"),
 )
 
+emit_ranges(
+    "SLUG",
+    "Non-ASCII code points kept in heading ids: categories L, M, Nd and Nl.",
+    ranges(lambda c: unicodedata.category(c)[0] in "LM" or unicodedata.category(c) in ("Nd", "Nl")),
+)
+emit_ranges(
+    "MARK",
+    "Non-ASCII code points in the Unicode general category M (mark).",
+    ranges(lambda c: unicodedata.category(c)[0] == "M"),
+)
+
 entities = sorted(
     (k[:-1], v) for k, v in html.entities.html5.items() if k.endswith(";")
 )

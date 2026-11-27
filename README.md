@@ -14,6 +14,8 @@ A fast Rust implementation of Comark (Markdown with components).
 - GFM extensions: tables, strikethrough, task lists, extended autolinks, and the
   raw HTML tag filter. All are enabled by default and can be turned off one by
   one.
+- Comark-compatible heading ids (on by default) and footnotes (opt-in), with
+  the same slugs and markup as Comark, checked against Comark's own output.
 - A typed syntax tree ([`oxmark::ast`](src/ast.rs)) that borrows text from the
   input whenever possible.
 - An HTML renderer that is **safe by default** for untrusted input.
@@ -38,9 +40,25 @@ match &doc.children[0] {
 let html = oxmark::render_html(&doc, &oxmark::HtmlOptions::default());
 ```
 
-Options are split in two: `oxmark::Options` selects the syntax extensions
-(`Options::gfm()`, the default, or `Options::commonmark()`), and
-`oxmark::HtmlOptions` controls rendering.
+Options are split in two: `oxmark::Options` selects the syntax extensions,
+and `oxmark::HtmlOptions` controls rendering. `Options::default()` follows
+Comark's defaults (GFM and heading ids); `Options::gfm()` and
+`Options::commonmark()` give plain GFM and strict CommonMark.
+
+```rust
+let options = oxmark::Options { footnotes: true, ..Default::default() };
+let html = oxmark::to_html_with(
+    "Text[^1].\n\n[^1]: The note.",
+    &options,
+    &oxmark::HtmlOptions::default(),
+);
+assert!(html.contains(r##"<a href="#fn-1" id="fnref-1">[1]</a>"##));
+```
+
+Differences with Comark, on purpose: footnote definitions hold inline
+Markdown (Comark keeps them as plain text), a footnote referenced several
+times gets unique ids (`fnref-a`, `fnref-a-2`), and heading text is not
+NFC-normalized before computing its id.
 
 ## Security
 
