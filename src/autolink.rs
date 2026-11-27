@@ -67,6 +67,7 @@ fn split<'a>(text: Cow<'a, str>, out: &mut Vec<Inline<'a>>) {
             url,
             title: Cow::Borrowed(""),
             kind,
+            attrs: Default::default(),
             children: vec![Inline::Text(label)],
         }));
         done = end;

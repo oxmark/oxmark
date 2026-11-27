@@ -18,7 +18,7 @@ fn raw_html_is_escaped_by_default() {
     );
     assert_eq!(
         html("<div onclick=\"alert(1)\">\n\n*x*\n\n</div>"),
-        "&lt;div onclick=&quot;alert(1)&quot;&gt;\n<p><em>x</em></p>\n&lt;/div&gt;\n"
+        "&lt;div onclick=\"alert(1)\"&gt;\n<p><em>x</em></p>\n&lt;/div&gt;\n"
     );
     assert_eq!(html("<!-- <script> -->"), "&lt;!-- &lt;script&gt; --&gt;\n");
 }
@@ -80,12 +80,12 @@ fn dangerous_schemes_are_dropped() {
         "<p><a href=\"\">javascript:alert(1)</a></p>\n"
     );
     assert_eq!(
-        html("[x]: javascript:alert(1)\n\n[x]"),
+        html("[x]: javascript:alert(1)\n\n[x][]"),
         "<p><a href=\"\">x</a></p>\n"
     );
     assert_eq!(
         html("![x](javascript:alert(1))"),
-        "<p><img src=\"\" alt=\"x\" /></p>\n"
+        "<p><img src=\"\" alt=\"x\"></p>\n"
     );
 }
 
@@ -98,7 +98,7 @@ fn safe_urls_are_kept() {
     );
     assert_eq!(
         html("![p](data:image/png;base64,iVBORw0KGgo=)"),
-        "<p><img src=\"data:image/png;base64,iVBORw0KGgo=\" alt=\"p\" /></p>\n"
+        "<p><img src=\"data:image/png;base64,iVBORw0KGgo=\" alt=\"p\"></p>\n"
     );
     // A data URL is only allowed for images.
     assert_eq!(
@@ -120,11 +120,12 @@ fn attributes_cannot_be_broken_out_of() {
     );
     assert_eq!(
         html("![a\" onerror=\"alert(1)](i.png)"),
-        "<p><img src=\"i.png\" alt=\"a&quot; onerror=&quot;alert(1)\" /></p>\n"
+        "<p><img src=\"i.png\" alt=\"a&quot; onerror=&quot;alert(1)\"></p>\n"
     );
     assert_eq!(
         html("```x\"onclick=\"alert(1)\ncode\n```"),
-        "<pre><code class=\"language-x&quot;onclick=&quot;alert(1)\">code\n</code></pre>\n"
+        "<pre data-language=\"x\" data-meta=\"&quot;onclick=&quot;alert(1)\">\
+         <code class=\"language-x\">code</code></pre>\n"
     );
     assert_eq!(html("`<script>`"), "<p><code>&lt;script&gt;</code></p>\n");
 }
@@ -144,5 +145,116 @@ fn trusted_mode_renders_everything() {
             &HtmlOptions::trusted()
         ),
         "<script>x</script>\n<p><a href=\"javascript:b\">a</a></p>\n"
+    );
+}
+
+#[test]
+fn character_references_cannot_hide_a_scheme() {
+    // Browsers decode references in attributes: the sanitizer does too.
+    for href in [
+        "&#106;avascript:alert(1)",
+        "&#x6A;avascript&colon;alert(1)",
+        "&#0000106;avascript:alert(1)",
+    ] {
+        let out = html(&format!(":a[x]{{href=\"{href}\"}}"));
+        assert_eq!(out, "<a>x</a>\n", "{href}");
+    }
+    // A reference in a link destination is escaped, not decoded twice.
+    assert_eq!(
+        html("[x](&amp;#106;avascript:alert(1))"),
+        "<p><a href=\"&amp;#106;avascript:alert(1)\">x</a></p>\n"
+    );
+    assert_eq!(html("AT&T &copy &amp;"), "<p>AT&amp;T &amp;copy &</p>\n");
+}
+
+#[test]
+fn component_attributes_are_sanitized() {
+    assert_eq!(
+        html(":a[x]{href=\"javascript:alert(1)\" onclick=\"alert(1)\"}"),
+        "<a>x</a>\n"
+    );
+    assert_eq!(
+        html("::div{srcdoc=\"<script>\" formaction=\"j\" v-html=\"x\" :innerHTML=\"y\" @click=\"z\" data-ok=\"1\"}\nx\n::"),
+        "<div data-ok=\"1\">x</div>\n"
+    );
+    assert_eq!(
+        html("::div{style=\"background:url(javascript:alert(1))\"}\nx\n::"),
+        "<div>x</div>\n"
+    );
+    assert_eq!(
+        html(":img{srcset=\"javascript:alert(1) 1x\"} :a[s]{attributeName=\"href\"}"),
+        "<p><img> <a>s</a></p>\n"
+    );
+    assert_eq!(html(":img{src=\"data:text/html,<script>\"}"), "<img>\n");
+    assert_eq!(
+        html(":img{src=\"data:image/png;base64,iVBORw0KGgo=\"}"),
+        "<img src=\"data:image/png;base64,iVBORw0KGgo=\">\n"
+    );
+}
+
+#[test]
+fn bindings_are_checked_after_decoding() {
+    assert_eq!(html(":a[x]{:href='\"javascript:alert(1)\"'}"), "<a>x</a>\n");
+    assert_eq!(
+        html(":a[x]{:href='\"\\u006aavascript:alert(1)\"'}"),
+        "<a>x</a>\n"
+    );
+    assert_eq!(
+        html("---\nu: \"javascript:alert(1)\"\n---\n:a[x]{:href=\"frontmatter.u\"}"),
+        "<a>x</a>\n"
+    );
+}
+
+#[test]
+fn attributes_on_markdown_are_sanitized() {
+    assert_eq!(
+        html("[x](https://a.b){onclick=\"alert(1)\" .c}"),
+        "<p><a href=\"https://a.b\" class=\"c\">x</a></p>\n"
+    );
+    assert_eq!(
+        html("[x]{onmouseover=\"alert(1)\" title=\"t\"}"),
+        "<p><span title=\"t\">x</span></p>\n"
+    );
+    assert_eq!(
+        html("# Title {onclick=\"alert(1)\" .c}"),
+        "<h1 id=\"title\" class=\"c\">Title</h1>\n"
+    );
+    // A key that could break out of the attribute list is dropped.
+    assert_eq!(html("[x]{a\"b=1 c=2}"), "<p><span c=\"2\">x</span></p>\n");
+}
+
+#[test]
+fn dangerous_components_are_dropped() {
+    for md in [
+        "::script\nalert(1)\n::",
+        ":script[alert(1)]",
+        "::iframe{src=\"https://evil.example\"}\nx\n::",
+        "::style\nbody{display:none}\n::",
+        "::div{is=\"script\"}\nx\n::",
+        ":span[x]{as=\"iframe\"}",
+        "::object{data=\"x.swf\"}\n::",
+    ] {
+        let out = html(md);
+        assert!(
+            !out.contains("script")
+                && !out.contains("iframe")
+                && !out.contains("style")
+                && !out.contains("object")
+                && !out.contains("swf"),
+            "{md} gave {out}"
+        );
+    }
+    assert_eq!(html(":span[x]{as=\"b\"}"), "<span as=\"b\">x</span>\n");
+}
+
+#[test]
+fn trusted_mode_keeps_components() {
+    assert_eq!(
+        to_html_with(
+            ":a[x]{href=\"javascript:b\" onclick=\"c\"}",
+            &Options::default(),
+            &HtmlOptions::trusted()
+        ),
+        "<a href=\"javascript:b\" onclick=\"c\">x</a>\n"
     );
 }

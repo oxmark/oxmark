@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::ast::{Inline, Link, LinkKind};
+use crate::ast::{self, Attributes, Inline, Link, LinkKind};
 use crate::block::{lift, to_cow};
 use crate::scan;
 use crate::text::{
@@ -100,9 +100,27 @@ enum Kind<'a> {
     Image(Box<(Cow<'a, str>, Cow<'a, str>)>),
     /// A footnote reference; its children are the label text, dropped.
     FootnoteRef(Cow<'a, str>, u32, u32),
+    /// A Comark span (`[text]`).
+    Span,
+    /// A Comark inline component (`:name[content]`).
+    Component(Cow<'a, str>),
+    /// An attribute list (`{...}`), attached to the previous element when
+    /// building the tree.
+    Attrs(Box<PendingAttrs<'a>>),
     /// A container that would nest too deeply; its children are spliced
     /// into its parent when building the tree.
     Group,
+}
+
+#[derive(Debug)]
+struct PendingAttrs<'a> {
+    attrs: Attributes<'a>,
+    /// The source of the list, used when it turns out to be text.
+    start: usize,
+    end: usize,
+    /// It follows plain text, at the end of a line: it belongs to the
+    /// enclosing block when it ends the content.
+    after_text: bool,
 }
 
 #[derive(Debug)]
@@ -129,20 +147,35 @@ struct Delim {
     can_close: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BracketKind {
+    Link,
+    Image,
+    /// A Comark span: Comark decides this at the `[`, from the character
+    /// after its matching `]`.
+    Span,
+    Component,
+}
+
 #[derive(Debug)]
 struct Bracket {
     node: usize,
     prev_delim: usize,
     index: usize,
-    image: bool,
+    kind: BracketKind,
+    /// The matching `]` (Comark's bracket matching), or `NONE`.
+    close: usize,
     active: bool,
     bracket_after: bool,
+    /// Whether this bracket or one below it is the active text of a link
+    /// whose `]` is followed by `(` or `[`.
+    in_link_text: bool,
 }
 
 /// Bytes that may start something other than plain text.
 static SPECIAL: [bool; 256] = {
     let mut t = [false; 256];
-    let chars = b"\n`[]\\!<&*_~";
+    let chars = b"\n`[]\\!<&*_~:{";
     let mut i = 0;
     while i < chars.len() {
         t[chars[i] as usize] = true;
@@ -171,6 +204,14 @@ struct Parser<'a, 's, 'r> {
     no_title_end: u8,
     /// Whether the subject may contain an extended autolink.
     autolink_candidates: bool,
+    /// Matching `]` of each `[`, as `(open, close)` sorted by `open`.
+    bracket_pairs: Option<Vec<(usize, usize)>>,
+    /// Attributes at the end of the content, for the enclosing block.
+    block_attrs: Attributes<'a>,
+    /// A `{` before this position after text is not an attribute list.
+    rejected_until: usize,
+    /// Start of the first attribute list without a closing `}`.
+    unclosed_from: usize,
 }
 
 /// Parses inline content.
@@ -181,6 +222,18 @@ pub(crate) fn parse<'a>(
     opts: &Options,
     scratch: &mut Scratch<'a>,
 ) -> Vec<Inline<'a>> {
+    parse_block(src, subject, refs, opts, scratch).0
+}
+
+/// Parses the inline content of a block. Also returns the attributes of a
+/// trailing `{...}`, which belong to the block.
+pub(crate) fn parse_block<'a>(
+    src: &'a str,
+    subject: &str,
+    refs: &RefMap<'a>,
+    opts: &Options,
+    scratch: &mut Scratch<'a>,
+) -> (Vec<Inline<'a>>, Attributes<'a>) {
     let mut nodes = std::mem::take(&mut scratch.nodes);
     nodes.clear();
     let mut delims = std::mem::take(&mut scratch.delims);
@@ -205,6 +258,10 @@ pub(crate) fn parse<'a>(
         no_title_end: 0,
         autolink_candidates: opts.autolinks
             && (subject.contains('@') || subject.contains("://") || subject.contains("www.")),
+        bracket_pairs: None,
+        block_attrs: Attributes::default(),
+        rejected_until: 0,
+        unclosed_from: NONE,
     };
     p.nodes.push(Node {
         kind: Kind::Root,
@@ -221,7 +278,7 @@ pub(crate) fn parse<'a>(
     scratch.delims = p.delims;
     scratch.brackets = p.brackets;
     scratch.footnotes = p.footnotes;
-    out
+    (out, p.block_attrs)
 }
 
 /// State kept between the inline parses of a document: reused buffers and
@@ -301,7 +358,8 @@ impl<'a, 's, 'r> Parser<'a, 's, 'r> {
                 b'~' if self.opts.strikethrough => self.delim(c),
                 b'[' => {
                     let node = self.add_text(self.pos, self.pos + 1);
-                    self.add_bracket(node, self.pos, false);
+                    let (kind, close) = self.bracket_kind(self.pos);
+                    self.add_bracket(node, self.pos, kind, close);
                     self.pos += 1;
                     true
                 }
@@ -309,12 +367,17 @@ impl<'a, 's, 'r> Parser<'a, 's, 'r> {
                 b']' => self.close_bracket(),
                 b'<' => self.autolink_or_html(),
                 b'&' => self.entity(),
+                b':' if self.opts.components => self.inline_component(),
+                b'{' if self.opts.attributes => self.attributes(),
                 _ => self.string(),
             };
             if !handled {
                 self.add_text(self.pos, self.pos + 1);
                 self.pos += 1;
             }
+        }
+        if self.opts.components {
+            self.close_open_spans();
         }
         self.process_emphasis(NONE);
     }
@@ -698,24 +761,204 @@ impl<'a, 's, 'r> Parser<'a, 's, 'r> {
         }
     }
 
-    fn add_bracket(&mut self, node: usize, index: usize, image: bool) {
+    fn add_bracket(&mut self, node: usize, index: usize, kind: BracketKind, close: usize) {
+        let b = self.b;
+        let link_text = kind == BracketKind::Link
+            && close != NONE
+            && matches!(b.get(close + 1), Some(b'(' | b'['));
+        let mut in_link_text = link_text;
         if let Some(top) = self.brackets.last_mut() {
             top.bracket_after = true;
+            in_link_text |= top.in_link_text;
         }
         self.brackets.push(Bracket {
+            in_link_text,
             node,
             prev_delim: self.delim_top,
             index,
-            image,
+            kind,
+            close,
             active: true,
             bracket_after: false,
         });
     }
 
+    /// The `]` matching the `[` at `open`, like Comark's
+    /// `findClosingBracket`: escapes are skipped and nested pairs counted.
+    fn matching_bracket(&mut self, open: usize) -> usize {
+        let b = self.b;
+        let pairs = self.bracket_pairs.get_or_insert_with(|| {
+            let mut pairs = Vec::new();
+            let mut stack = Vec::new();
+            let mut i = 0;
+            while i < b.len() {
+                match b[i] {
+                    b'\\' => i += 1,
+                    b'[' => stack.push(i),
+                    b']' => {
+                        if let Some(o) = stack.pop() {
+                            pairs.push((o, i));
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            pairs.sort_unstable();
+            pairs
+        });
+        match pairs.binary_search_by_key(&open, |p| p.0) {
+            Ok(i) => pairs[i].1,
+            Err(_) => NONE,
+        }
+    }
+
+    /// Whether the `[` at `pos` opens a Comark span or a link.
+    fn bracket_kind(&mut self, pos: usize) -> (BracketKind, usize) {
+        if !self.opts.components {
+            return (BracketKind::Link, NONE);
+        }
+        let close = self.matching_bracket(pos);
+        let b = self.b;
+        let next = if close == NONE {
+            None
+        } else {
+            b.get(close + 1).copied()
+        };
+        let adjacent_footnote =
+            next == Some(b'[') && b.get(pos + 1) == Some(&b'^') && b.get(close + 2) == Some(&b'^');
+        if matches!(next, Some(b'(' | b'[')) && !adjacent_footnote {
+            return (BracketKind::Link, close);
+        }
+        // Inside link text, only `[text]{attrs}` is a span.
+        if next != Some(b'{') && self.brackets.last().is_some_and(|br| br.in_link_text) {
+            return (BracketKind::Link, close);
+        }
+        (BracketKind::Span, close)
+    }
+
+    /// Turns the spans left open at the end into spans running to the end,
+    /// as Comark does.
+    fn close_open_spans(&mut self) {
+        while let Some(opener) = self.brackets.pop() {
+            if opener.kind != BracketKind::Span || opener.close != NONE {
+                continue;
+            }
+            self.wrap_bracket(opener, Kind::Span);
+        }
+    }
+
+    /// Makes the content after a bracket opener the children of a new node.
+    fn wrap_bracket(&mut self, opener: Bracket, kind: Kind<'a>) {
+        let node = self.new_node(kind);
+        self.process_emphasis(opener.prev_delim);
+        self.adopt_following(opener.node, NONE, node);
+        self.insert_after(opener.node, node);
+        self.unlink(opener.node);
+    }
+
+    /// `:name`, `:name[content]`.
+    fn inline_component(&mut self) -> bool {
+        let start = self.pos;
+        let b = self.b;
+        if start > 0
+            && !matches!(
+                b[start - 1],
+                b' ' | b'\t' | b'\n' | b'*' | b'_' | b'[' | b']' | b'}' | b')' | b'>'
+            )
+        {
+            return false;
+        }
+        let name_start = start + 1;
+        if !b
+            .get(name_start)
+            .is_some_and(|&c| c.is_ascii_alphabetic() || c == b'$')
+        {
+            return false;
+        }
+        let mut end = name_start;
+        while end < b.len()
+            && (b[end].is_ascii_alphanumeric() || matches!(b[end], b'_' | b'$' | b'-'))
+        {
+            end += 1;
+        }
+        if b.get(end) == Some(&b'[') {
+            let close = self.matching_bracket(end);
+            if close != NONE {
+                // The opener stays a text node until its bracket closes.
+                let node = self.add_text(start, end + 1);
+                self.add_bracket(node, end, BracketKind::Component, close);
+                self.pos = end + 1;
+                return true;
+            }
+        }
+        let name = self.cow(name_start, end);
+        self.append(Kind::Component(name));
+        self.pos = end;
+        true
+    }
+
+    /// `{.class #id key="value"}` after an element or at the end of a line.
+    fn attributes(&mut self) -> bool {
+        let start = self.pos;
+        let b = self.b;
+        // Template syntax: `{{ x }}`, `${ x }`.
+        if b.get(start + 1) == Some(&b'{') || (start > 0 && matches!(b[start - 1], b'{' | b'$')) {
+            return false;
+        }
+        let last = self.nodes[0].last;
+        let after_closer = last != NONE
+            && self.delim_top != NONE
+            && self.delims[self.delim_top].node == last
+            && self.delims[self.delim_top].can_close;
+        let after_text = last == NONE
+            || matches!(
+                self.nodes[last].kind,
+                Kind::Text(_) | Kind::SoftBreak | Kind::HardBreak
+            );
+        let plain = after_text && !after_closer;
+        if plain && start < self.rejected_until {
+            return false;
+        }
+        if start > self.unclosed_from {
+            return false;
+        }
+        let Some(props) = crate::props::search(self.src, self.subject, start) else {
+            return false;
+        };
+        if !props.closed {
+            self.unclosed_from = self.unclosed_from.min(start);
+            if plain {
+                return false;
+            }
+        }
+        let end = props.end;
+        if plain {
+            let mut j = end;
+            while j < b.len() && matches!(b[j], b' ' | b'\t') {
+                j += 1;
+            }
+            if j < b.len() && b[j] != b'\n' {
+                self.rejected_until = end;
+                return false;
+            }
+        }
+        self.append(Kind::Attrs(Box::new(PendingAttrs {
+            attrs: props.attrs,
+            start,
+            end,
+            after_text: plain,
+        })));
+        self.pos = end;
+        true
+    }
+
     fn bang(&mut self) -> bool {
-        if self.b.get(self.pos + 1) == Some(&b'[') {
+        if self.b.get(self.pos + 1) == Some(&b'[')
+            && !(self.opts.components && self.bracket_kind(self.pos + 1).0 == BracketKind::Span)
+        {
             let node = self.add_text(self.pos, self.pos + 2);
-            self.add_bracket(node, self.pos + 1, true);
+            self.add_bracket(node, self.pos + 1, BracketKind::Image, NONE);
             self.pos += 2;
         } else {
             self.add_text(self.pos, self.pos + 1);
@@ -772,7 +1015,41 @@ impl<'a, 's, 'r> Parser<'a, 's, 'r> {
             self.brackets.pop();
             return true;
         }
-        let image = opener.image;
+        let image = opener.kind == BracketKind::Image;
+        if matches!(opener.kind, BracketKind::Span | BracketKind::Component) {
+            if opener.close == start - 1 {
+                if opener.kind == BracketKind::Span
+                    && self.opts.footnotes
+                    && self.footnote_ref(start)
+                {
+                    return true;
+                }
+                let opener = self.brackets.pop().unwrap();
+                let kind = if opener.kind == BracketKind::Span {
+                    Kind::Span
+                } else {
+                    let Kind::Text(t) = &self.nodes[opener.node].kind else {
+                        unreachable!()
+                    };
+                    // The opener text is `:name[`.
+                    let name = match t {
+                        Cow::Borrowed(s) => Cow::Borrowed(&s[1..s.len() - 1]),
+                        Cow::Owned(s) => Cow::Owned(s[1..s.len() - 1].to_owned()),
+                    };
+                    Kind::Component(name)
+                };
+                self.wrap_bracket(opener, kind);
+                self.pos = start;
+                return true;
+            }
+            if opener.kind == BracketKind::Component {
+                // Brackets nested differently than Comark sees them: the
+                // opener stays text.
+                self.brackets.pop();
+                self.add_text(start - 1, start);
+                return true;
+            }
+        }
         let mut target = None;
         if self.b.get(start) == Some(&b'(') {
             if let Some((url, title, end)) = self.inline_link(start) {
@@ -821,9 +1098,10 @@ impl<'a, 's, 'r> Parser<'a, 's, 'r> {
         self.unlink(opener.node);
         if !image {
             for b in &mut self.brackets {
-                if !b.image {
+                if b.kind == BracketKind::Link {
                     b.active = false;
                 }
+                b.in_link_text = false;
             }
         }
         true
@@ -937,11 +1215,20 @@ impl<'a, 's, 'r> Parser<'a, 's, 'r> {
                 }
                 Kind::SoftBreak => Inline::SoftBreak,
                 Kind::HardBreak => Inline::HardBreak,
-                Kind::Code(t) => Inline::Code(t),
+                Kind::Code(t) => Inline::Code(ast::Code {
+                    literal: t,
+                    attrs: Attributes::default(),
+                }),
                 Kind::Html(t) => Inline::Html(t),
-                Kind::Emphasis => Inline::Emphasis(self.build(c, in_link)),
-                Kind::Strong => Inline::Strong(self.build(c, in_link)),
-                Kind::Strikethrough => Inline::Strikethrough(self.build(c, in_link)),
+                Kind::Emphasis => Inline::Emphasis(self.element(c, in_link)),
+                Kind::Strong => Inline::Strong(self.element(c, in_link)),
+                Kind::Strikethrough => Inline::Strikethrough(self.element(c, in_link)),
+                Kind::Span => Inline::Span(self.element(c, in_link)),
+                Kind::Component(name) => Inline::Component(ast::InlineComponent {
+                    name,
+                    attrs: Attributes::default(),
+                    children: self.build(c, in_link),
+                }),
                 Kind::FootnoteRef(label, index, occurrence) => {
                     Inline::FootnoteReference(crate::ast::FootnoteReference {
                         label,
@@ -953,14 +1240,25 @@ impl<'a, 's, 'r> Parser<'a, 's, 'r> {
                     url: link.0,
                     title: link.1,
                     kind: link.2,
+                    attrs: Attributes::default(),
                     children: self.build(c, true),
                 }),
                 Kind::Image(image) => Inline::Image(Link {
                     url: image.0,
                     title: image.1,
                     kind: LinkKind::Normal,
+                    attrs: Attributes::default(),
                     children: self.build(c, in_link),
                 }),
+                Kind::Attrs(pending) => {
+                    self.attach(
+                        &mut out,
+                        *pending,
+                        parent == 0 && next == NONE && groups.is_empty(),
+                    );
+                    c = next;
+                    continue;
+                }
             };
             out.push(inline);
             c = next;
@@ -969,6 +1267,56 @@ impl<'a, 's, 'r> Parser<'a, 's, 'r> {
             crate::autolink::extend(self.src, &mut out);
         }
         out
+    }
+
+    fn element(&mut self, c: usize, in_link: bool) -> ast::Element<'a> {
+        ast::Element {
+            attrs: Attributes::default(),
+            children: self.build(c, in_link),
+        }
+    }
+
+    /// Attaches an attribute list to the element before it.
+    fn attach(&mut self, out: &mut Vec<Inline<'a>>, pending: PendingAttrs<'a>, at_end: bool) {
+        if pending.after_text {
+            // Only the attributes ending the content are kept, for the
+            // block; Comark drops the others.
+            if at_end && self.block_attrs.is_empty() {
+                if let Some(Inline::Text(t)) = out.last_mut() {
+                    let trimmed = t.trim_end_matches([' ', '\t']).len();
+                    trim_cow_end(t, t.len() - trimmed);
+                    if t.is_empty() {
+                        out.pop();
+                    }
+                }
+                self.block_attrs = pending.attrs;
+            }
+            return;
+        }
+        let target = match out.last_mut() {
+            Some(
+                Inline::Emphasis(e)
+                | Inline::Strong(e)
+                | Inline::Strikethrough(e)
+                | Inline::Span(e),
+            ) => &mut e.attrs,
+            Some(Inline::Code(c)) => &mut c.attrs,
+            Some(Inline::Link(l) | Inline::Image(l)) => &mut l.attrs,
+            Some(Inline::Component(c)) => &mut c.attrs,
+            Some(Inline::Text(_)) => {
+                // After a delimiter run that closed nothing: plain text.
+                let text = self.cow(pending.start, pending.end);
+                if let Some(Inline::Text(prev)) = out.last_mut() {
+                    merge_text(self.src, prev, text);
+                }
+                return;
+            }
+            _ => return,
+        };
+        // A second list after the same element is dropped, like in Comark.
+        if target.is_empty() {
+            *target = pending.attrs;
+        }
     }
 }
 

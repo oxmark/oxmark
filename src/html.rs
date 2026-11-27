@@ -1,6 +1,11 @@
-//! HTML rendering, with sanitizing of raw HTML and URLs.
+//! HTML rendering, with sanitizing of raw HTML, URLs and attributes.
 
-use crate::ast::{Alignment, Block, CodeBlock, Document, Footnote, Inline, Link, List, ListKind};
+use crate::ast::{
+    Alignment, Attribute, Attributes, Block, CodeBlock, Component, Document, Footnote, Inline,
+    Link, List, ListItem, ListKind,
+};
+use crate::text::{decode_entities, parse_entity};
+use crate::yaml::Value;
 
 /// What to do with raw HTML (HTML blocks and inline tags) when rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -15,9 +20,24 @@ pub enum RawHtml {
     Allow,
 }
 
+/// The shape of the HTML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HtmlStyle {
+    /// The HTML of Comark's renderer: a container holding a single paragraph
+    /// renders its content without `<p>`, code blocks carry `data-language`
+    /// and no final line ending, tables align with `style`, void tags have no
+    /// slash...
+    #[default]
+    Comark,
+    /// The HTML of the CommonMark reference implementation (`cmark-gfm`).
+    CommonMark,
+}
+
 /// HTML rendering options. The defaults are safe for untrusted input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HtmlOptions {
+    /// The shape of the HTML. Defaults to [`HtmlStyle::Comark`].
+    pub style: HtmlStyle,
     /// Raw HTML policy. Defaults to [`RawHtml::Escape`].
     pub raw_html: RawHtml,
     /// When `false` (the default), link and image URLs with a dangerous
@@ -28,27 +48,50 @@ pub struct HtmlOptions {
     /// (`<script>`, `<style>`, `<iframe>`, `<textarea>`, `<title>`, `<xmp>`,
     /// `<noembed>`, `<noframes>` and `<plaintext>`). Defaults to `true`.
     pub tagfilter: bool,
+    /// Apply the rules of Comark's security plugin to the attributes of
+    /// components, spans and elements: event handlers (`on*`), markup sinks
+    /// (`*html`, `srcdoc`...) and URL attributes with a dangerous scheme are
+    /// dropped. Components that would run code (`script`, `style`, `iframe`,
+    /// `object`...) are dropped with their content. Defaults to `true`.
+    pub sanitize: bool,
+    /// In Comark style, render the single paragraph of a block quote, list
+    /// item, component or slot without `<p>`, like Comark's `autoUnwrap`.
+    /// Defaults to `true`.
+    pub unwrap: bool,
 }
 
 impl Default for HtmlOptions {
     fn default() -> Self {
         HtmlOptions {
+            style: HtmlStyle::Comark,
             raw_html: RawHtml::Escape,
             dangerous_urls: false,
             tagfilter: true,
+            sanitize: true,
+            unwrap: true,
         }
     }
 }
 
 impl HtmlOptions {
-    /// Options that trust the input completely: raw HTML and every URL are
-    /// rendered as written, without the GFM tag filter. This matches the
-    /// output of the CommonMark reference implementation in its unsafe mode.
+    /// Options that trust the input completely: raw HTML, every URL and every
+    /// attribute are rendered as written, without the GFM tag filter.
     pub fn trusted() -> Self {
         HtmlOptions {
             raw_html: RawHtml::Allow,
             dangerous_urls: true,
             tagfilter: false,
+            sanitize: false,
+            ..HtmlOptions::default()
+        }
+    }
+
+    /// [`trusted`](Self::trusted) options with the CommonMark style: the
+    /// output of the CommonMark reference implementation in its unsafe mode.
+    pub fn commonmark_trusted() -> Self {
+        HtmlOptions {
+            style: HtmlStyle::CommonMark,
+            ..HtmlOptions::trusted()
         }
     }
 }
@@ -62,16 +105,65 @@ pub fn render_html(doc: &Document<'_>, options: &HtmlOptions) -> String {
 
 /// Renders a document to HTML, appending to `out`.
 pub fn render_html_to(doc: &Document<'_>, options: &HtmlOptions, out: &mut String) {
-    let mut r = Renderer { out, opts: options };
+    let mut r = Renderer {
+        out,
+        opts: options,
+        comark: options.style == HtmlStyle::Comark,
+        frontmatter_src: doc.frontmatter.as_deref(),
+        frontmatter: None,
+        scopes: Vec::new(),
+    };
     r.blocks(&doc.children, false);
     if !doc.footnotes.is_empty() {
         r.footnotes(&doc.footnotes);
     }
 }
 
+/// Tags that render without content or closing tag.
+const VOID_TAGS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+/// Component names that are not rendered when sanitizing: they run code or
+/// change how the rest of the page is read.
+const BLOCKED_TAGS: &[&str] = &[
+    "applet",
+    "base",
+    "embed",
+    "frame",
+    "frameset",
+    "iframe",
+    "link",
+    "meta",
+    "noembed",
+    "noframes",
+    "noscript",
+    "object",
+    "plaintext",
+    "script",
+    "style",
+    "textarea",
+    "title",
+    "xmp",
+];
+
+fn is_void(tag: &str) -> bool {
+    VOID_TAGS.iter().any(|t| t.eq_ignore_ascii_case(tag))
+}
+
+/// An attribute to write: a name and a value.
+type Attr<'s> = (&'s str, &'s str);
+
 struct Renderer<'o, 'w> {
     out: &'w mut String,
     opts: &'o HtmlOptions,
+    comark: bool,
+    /// The frontmatter, parsed when a binding first needs it.
+    frontmatter_src: Option<&'w str>,
+    frontmatter: Option<Option<Value>>,
+    /// The props of the enclosing components, for `props.x` bindings.
+    scopes: Vec<Vec<(String, Value)>>,
 }
 
 impl Renderer<'_, '_> {
@@ -87,85 +179,273 @@ impl Renderer<'_, '_> {
         self.out.push_str(s);
     }
 
+    #[inline]
+    fn text(&mut self, s: &str) {
+        if self.comark {
+            escape_text(self.out, s);
+        } else {
+            escape_html(self.out, s);
+        }
+    }
+
+    /// A void tag ending: ` />` in CommonMark style, `>` in Comark style.
+    #[inline]
+    fn void_end(&mut self) {
+        self.push(if self.comark { ">" } else { " />" });
+    }
+
     fn blocks(&mut self, blocks: &[Block<'_>], tight: bool) {
         for b in blocks {
             self.block(b, tight);
         }
     }
 
+    /// The content of a container. In Comark style, a single paragraph is
+    /// rendered without `<p>` (Comark's `autoUnwrap`).
+    fn container(&mut self, blocks: &[Block<'_>]) {
+        match blocks {
+            [Block::Paragraph(p)] if self.comark && self.opts.unwrap => self.inlines(&p.children),
+            _ => self.blocks(blocks, false),
+        }
+    }
+
+    /// The attributes a single paragraph lends to its container when it is
+    /// unwrapped.
+    fn unwrapped_attrs<'b>(&self, blocks: &'b [Block<'_>]) -> Option<&'b Attributes<'b>> {
+        match blocks {
+            [Block::Paragraph(p)] if self.comark && self.opts.unwrap && !p.attrs.is_empty() => {
+                Some(&p.attrs)
+            }
+            _ => None,
+        }
+    }
+
+    fn open_tag(&mut self, tag: &str, extra: &[Attr<'_>], attrs: &[&Attributes<'_>]) {
+        self.push("<");
+        self.push(tag);
+        self.attrs(tag, extra, attrs);
+        self.push(">");
+    }
+
+    /// Writes attributes: `extra` first, then each list in order. A later
+    /// value replaces an earlier one at its position, and classes are joined.
+    fn attrs(&mut self, tag: &str, extra: &[Attr<'_>], lists: &[&Attributes<'_>]) {
+        if self.opts.sanitize && tag.eq_ignore_ascii_case("object") {
+            return;
+        }
+        let count = lists.iter().map(|l| l.0.len()).sum::<usize>() + extra.len();
+        if count == 0 {
+            return;
+        }
+        let single = match lists {
+            [] => extra.len() <= 1 || no_dupes(extra.iter().map(|a| a.0)),
+            [l] if extra.is_empty() => true,
+            _ => false,
+        };
+        if single {
+            for &(name, value) in extra {
+                self.attr(name, value);
+            }
+            for l in lists {
+                for Attribute { name, value } in l.iter() {
+                    self.attr(name, value);
+                }
+            }
+            return;
+        }
+        let mut merged: Vec<(&str, std::borrow::Cow<'_, str>)> = Vec::with_capacity(count);
+        let all = extra.iter().copied().chain(
+            lists
+                .iter()
+                .flat_map(|l| l.iter().map(|a| (&*a.name, &*a.value))),
+        );
+        for (name, value) in all {
+            match merged.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, v)) if name == "class" => {
+                    let v = v.to_mut();
+                    v.push(' ');
+                    v.push_str(value);
+                }
+                Some((_, v)) => *v = std::borrow::Cow::Borrowed(value),
+                None => merged.push((name, std::borrow::Cow::Borrowed(value))),
+            }
+        }
+        for (name, value) in &merged {
+            self.attr(name, value);
+        }
+    }
+
+    fn attr(&mut self, name: &str, value: &str) {
+        if let Some(key) = name.strip_prefix(':') {
+            if let Some(v) = self.resolve(value) {
+                match v {
+                    Value::Bool(true) => self.attr(key, "true"),
+                    Value::Bool(false) | Value::Null => {}
+                    Value::String(s) | Value::Number(s) => self.attr(key, &s),
+                    v => self.attr(key, &v.to_json()),
+                }
+                return;
+            }
+        }
+        let key = name.strip_prefix(':').unwrap_or(name);
+        if !is_safe_attr_name(key) || (name == "id" && value.is_empty()) {
+            return;
+        }
+        if self.opts.sanitize && !is_safe_attr(name, value) {
+            return;
+        }
+        self.push(" ");
+        self.push(key);
+        if value == "true" && self.comark {
+            return;
+        }
+        self.push("=\"");
+        escape_attr(self.out, value);
+        self.push("\"");
+    }
+
+    /// Resolves a Comark binding (`:title="frontmatter.title"`) against the
+    /// frontmatter or the props of the enclosing component.
+    fn resolve(&mut self, path: &str) -> Option<Value> {
+        let mut parts = path.split('.');
+        let root = parts.next()?;
+        let mut current = match root {
+            "frontmatter" => {
+                let src = self.frontmatter_src?;
+                self.frontmatter
+                    .get_or_insert_with(|| crate::yaml::parse(src).ok().flatten())
+                    .as_ref()?
+            }
+            "props" => {
+                let key = parts.next()?;
+                let scope = self.scopes.last()?;
+                &scope.iter().find(|(k, _)| k == key)?.1
+            }
+            _ => return None,
+        };
+        for part in parts {
+            current = match current {
+                Value::Object(entries) => &entries.iter().find(|(k, _)| k == part)?.1,
+                Value::Array(items) => items.get(part.parse::<usize>().ok()?)?,
+                _ => return None,
+            };
+        }
+        Some(current.clone())
+    }
+
+    /// Makes the props of a component the scope of the bindings inside it.
+    fn push_scope(&mut self, attrs: &Attributes<'_>) {
+        let mut scope = Vec::with_capacity(attrs.0.len());
+        for a in attrs.iter() {
+            match a.name.strip_prefix(':') {
+                Some(key) => {
+                    if let Some(v) = self.resolve(&a.value) {
+                        scope.push((key.to_owned(), v));
+                    }
+                }
+                None => scope.push((a.name.to_string(), Value::String(a.value.to_string()))),
+            }
+        }
+        self.scopes.push(scope);
+    }
+
     fn block(&mut self, block: &Block<'_>, tight: bool) {
         match block {
-            Block::Paragraph(inlines) => {
+            Block::Paragraph(p) => {
                 if tight {
-                    self.inlines(inlines);
+                    self.inlines(&p.children);
                 } else {
                     self.cr();
-                    self.push("<p>");
-                    self.inlines(inlines);
+                    self.open_tag("p", &[], &[&p.attrs]);
+                    self.inlines(&p.children);
                     self.push("</p>\n");
                 }
             }
             Block::Heading(h) => {
-                let level = (b'0' + h.level) as char;
+                let tag =
+                    ["h1", "h2", "h3", "h4", "h5", "h6"][usize::from(h.level.clamp(1, 6)) - 1];
                 self.cr();
-                self.push("<h");
-                self.out.push(level);
-                if let Some(id) = &h.id {
-                    self.push(" id=\"");
-                    escape_html(self.out, id);
-                    self.push("\"");
+                match &h.id {
+                    Some(id) => self.open_tag(tag, &[("id", id)], &[&h.attrs]),
+                    None => self.open_tag(tag, &[], &[&h.attrs]),
                 }
-                self.push(">");
                 self.inlines(&h.children);
-                self.push("</h");
-                self.out.push(level);
+                self.push("</");
+                self.push(tag);
                 self.push(">\n");
             }
             Block::ThematicBreak => {
                 self.cr();
-                self.push("<hr />\n");
+                self.push("<hr");
+                self.void_end();
+                self.push("\n");
             }
-            Block::BlockQuote(children) => {
-                self.cr();
-                self.push("<blockquote>\n");
-                self.blocks(children, false);
-                self.cr();
-                self.push("</blockquote>\n");
-            }
-            Block::List(list) => self.list(list),
-            Block::CodeBlock(code) => self.code_block(code),
+            Block::BlockQuote(q) => match q.alert {
+                Some(kind) => {
+                    let attrs = Attributes(vec![Attribute {
+                        name: "as".into(),
+                        value: kind.as_str().into(),
+                    }]);
+                    self.blockquote(&q.children, &[&attrs])
+                }
+                None => self.blockquote(&q.children, &[]),
+            },
+            Block::List(list) => self.list(list, &[]),
+            Block::CodeBlock(code) => self.code_block(code, &[]),
             Block::HtmlBlock(html) => {
                 self.cr();
                 self.raw_html(html);
                 self.cr();
             }
-            Block::Table(table) => {
-                self.cr();
-                self.push("<table>\n<thead>\n<tr>\n");
-                for (cell, &align) in table.header.iter().zip(&table.alignments) {
-                    self.cell("th", align, cell);
-                }
-                self.push("</tr>\n</thead>\n");
-                if !table.rows.is_empty() {
-                    self.push("<tbody>\n");
-                    for row in &table.rows {
-                        self.push("<tr>\n");
-                        for (cell, &align) in row.iter().zip(&table.alignments) {
-                            self.cell("td", align, cell);
-                        }
-                        self.push("</tr>\n");
-                    }
-                    self.push("</tbody>\n");
-                }
-                self.push("</table>\n");
-            }
+            Block::Table(table) => self.table(table, &[]),
+            Block::Component(c) => self.component(c),
         }
+    }
+
+    fn blockquote(&mut self, children: &[Block<'_>], extra: &[&Attributes<'_>]) {
+        self.cr();
+        let mut lists: Vec<&Attributes<'_>> = Vec::new();
+        if let Some(a) = self.unwrapped_attrs(children) {
+            lists.push(a);
+        }
+        lists.extend_from_slice(extra);
+        self.open_tag("blockquote", &[], &lists);
+        if !self.comark {
+            self.push("\n");
+        }
+        self.container(children);
+        self.cr();
+        self.push("</blockquote>\n");
+    }
+
+    fn table(&mut self, table: &crate::ast::Table<'_>, extra: &[&Attributes<'_>]) {
+        self.cr();
+        self.open_tag("table", &[], extra);
+        self.push("\n<thead>\n<tr>\n");
+        for (cell, &align) in table.header.iter().zip(&table.alignments) {
+            self.cell("th", align, cell);
+        }
+        self.push("</tr>\n</thead>\n");
+        if !table.rows.is_empty() {
+            self.push("<tbody>\n");
+            for row in &table.rows {
+                self.push("<tr>\n");
+                for (cell, &align) in row.iter().zip(&table.alignments) {
+                    self.cell("td", align, cell);
+                }
+                self.push("</tr>\n");
+            }
+            self.push("</tbody>\n");
+        }
+        self.push("</table>\n");
     }
 
     /// The footnote section, with the markup of Comark's footnotes plugin.
     fn footnotes(&mut self, footnotes: &[Footnote<'_>]) {
         self.cr();
-        self.push("<section class=\"footnotes\">\n<hr />\n<h2 id=\"footnotes\">Footnotes</h2>\n<ol class=\"footnotes-list\">\n");
+        self.push("<section class=\"footnotes\">\n<hr");
+        self.void_end();
+        self.push("\n<h2 id=\"footnotes\">Footnotes</h2>\n<ol class=\"footnotes-list\">\n");
         for f in footnotes {
             self.push("<li id=\"fn-");
             footnote_id(self.out, &f.label);
@@ -181,12 +461,13 @@ impl Renderer<'_, '_> {
     fn cell(&mut self, tag: &str, align: Alignment, content: &[Inline<'_>]) {
         self.push("<");
         self.push(tag);
-        match align {
-            Alignment::None => {}
-            Alignment::Left => self.push(" align=\"left\""),
-            Alignment::Center => self.push(" align=\"center\""),
-            Alignment::Right => self.push(" align=\"right\""),
-        }
+        let (css, html) = match align {
+            Alignment::None => ("", ""),
+            Alignment::Left => (" style=\"text-align:left\"", " align=\"left\""),
+            Alignment::Center => (" style=\"text-align:center\"", " align=\"center\""),
+            Alignment::Right => (" style=\"text-align:right\"", " align=\"right\""),
+        };
+        self.push(if self.comark { css } else { html });
         self.push(">");
         self.inlines(content);
         self.push("</");
@@ -194,57 +475,214 @@ impl Renderer<'_, '_> {
         self.push(">\n");
     }
 
-    fn list(&mut self, list: &List<'_>) {
+    fn list(&mut self, list: &List<'_>, extra: &[&Attributes<'_>]) {
         self.cr();
-        let ordered = match list.kind {
-            ListKind::Bullet(_) => {
-                self.push("<ul>\n");
-                false
-            }
-            ListKind::Ordered { start, .. } => {
-                if start == 1 {
-                    self.push("<ol>\n");
-                } else {
-                    self.push("<ol start=\"");
-                    self.push(itoa(start, &mut [0; 10]));
-                    self.push("\">\n");
-                }
-                true
-            }
+        let mut buf = [0; 10];
+        let tag = match list.kind {
+            ListKind::Bullet(_) => "ul",
+            ListKind::Ordered { .. } => "ol",
         };
-        for item in &list.items {
-            self.cr();
-            self.push("<li>");
-            if let Some(checked) = item.task {
-                self.push(if checked {
-                    "<input type=\"checkbox\" checked=\"\" disabled=\"\" /> "
-                } else {
-                    "<input type=\"checkbox\" disabled=\"\" /> "
-                });
+        let mut own: Vec<Attr<'_>> = Vec::new();
+        if let ListKind::Ordered { start, .. } = list.kind {
+            if start != 1 {
+                own.push(("start", itoa(start, &mut buf)));
             }
-            self.blocks(&item.children, list.tight);
-            self.push("</li>\n");
+        }
+        if self.comark && list.items.iter().any(|i| i.task.is_some()) {
+            own.push(("class", "contains-task-list"));
+        }
+        self.open_tag(tag, &own, extra);
+        self.push("\n");
+        for item in &list.items {
+            self.item(item, list.tight);
         }
         self.cr();
-        self.push(if ordered { "</ol>\n" } else { "</ul>\n" });
+        self.push("</");
+        self.push(tag);
+        self.push(">\n");
     }
 
-    fn code_block(&mut self, code: &CodeBlock<'_>) {
+    fn item(&mut self, item: &ListItem<'_>, tight: bool) {
         self.cr();
-        self.push("<pre><code");
-        if let Some(lang) = code.language() {
+        let comark = self.comark;
+        let task_class: &[Attr<'_>] = if comark && item.task.is_some() {
+            &[("class", "task-list-item")]
+        } else {
+            &[]
+        };
+        // Comark keeps every paragraph, tight or not, and unwraps a single one.
+        let tight = tight && !comark;
+        let unwrap =
+            comark && self.opts.unwrap && matches!(item.children.as_slice(), [Block::Paragraph(_)]);
+        match (unwrap, item.children.first()) {
+            (true, Some(Block::Paragraph(p))) => {
+                self.open_tag("li", task_class, &[&p.attrs, &item.attrs])
+            }
+            _ => self.open_tag("li", task_class, &[&item.attrs]),
+        }
+        let checkbox = |r: &mut Self, checked: bool| {
+            r.push(match (comark, checked) {
+                (true, true) => {
+                    "<input class=\"task-list-item-checkbox\" type=\"checkbox\" disabled checked> "
+                }
+                (true, false) => {
+                    "<input class=\"task-list-item-checkbox\" type=\"checkbox\" disabled> "
+                }
+                (false, true) => "<input type=\"checkbox\" checked=\"\" disabled=\"\" /> ",
+                (false, false) => "<input type=\"checkbox\" disabled=\"\" /> ",
+            });
+        };
+        match (item.task, item.children.split_first()) {
+            // Comark puts the checkbox inside the first paragraph.
+            (Some(checked), Some((Block::Paragraph(p), rest))) if comark && !tight && !unwrap => {
+                self.open_tag("p", &[], &[&p.attrs]);
+                checkbox(self, checked);
+                self.inlines(&p.children);
+                self.push("</p>\n");
+                self.blocks(rest, false);
+            }
+            (task, _) => {
+                if let Some(checked) = task {
+                    checkbox(self, checked);
+                }
+                if unwrap {
+                    self.container(&item.children);
+                } else {
+                    self.blocks(&item.children, tight);
+                }
+            }
+        }
+        self.push("</li>\n");
+    }
+
+    fn code_block(&mut self, code: &CodeBlock<'_>, extra: &[&Attributes<'_>]) {
+        self.cr();
+        if !self.comark {
+            self.push("<pre><code");
+            if let Some(lang) = code.language() {
+                self.push(" class=\"language-");
+                escape_html(self.out, lang);
+                self.push("\"");
+            }
+            self.push(">");
+            escape_html(self.out, &code.literal);
+            self.push("</code></pre>\n");
+            return;
+        }
+        let info = CodeInfo::parse(&code.info);
+        let mut own: Vec<Attr<'_>> = Vec::with_capacity(4);
+        let highlights = info.highlights_json();
+        for part in &info.order {
+            match part {
+                InfoPart::Language => own.push(("data-language", info.language)),
+                InfoPart::Highlights => own.push(("data-highlights", &highlights)),
+                InfoPart::Filename => own.push(("data-filename", &info.filename)),
+                InfoPart::Meta => own.push(("data-meta", info.meta)),
+            }
+        }
+        self.open_tag("pre", &own, extra);
+        self.push("<code");
+        if !info.language.is_empty() {
             self.push(" class=\"language-");
-            escape_html(self.out, lang);
+            escape_attr(self.out, info.language);
             self.push("\"");
         }
         self.push(">");
-        escape_html(self.out, &code.literal);
+        let literal = code.literal.strip_suffix('\n').unwrap_or(&code.literal);
+        escape_text(self.out, literal);
         self.push("</code></pre>\n");
+    }
+
+    fn component(&mut self, c: &Component<'_>) {
+        let name: &str = &c.name;
+        if self.blocked(name, &c.attrs) {
+            return;
+        }
+        // `::ul`, `::table`... around a single element of that kind give
+        // their attributes to it.
+        if c.slots.is_empty() {
+            if let [child] = c.children.as_slice() {
+                let wrapped = match (name, child) {
+                    ("ul", Block::List(l)) if matches!(l.kind, ListKind::Bullet(_)) => true,
+                    ("ol", Block::List(l)) => matches!(l.kind, ListKind::Ordered { .. }),
+                    ("table", Block::Table(_))
+                    | ("blockquote", Block::BlockQuote(_))
+                    | ("pre", Block::CodeBlock(_)) => true,
+                    _ => false,
+                };
+                if wrapped && self.comark {
+                    match child {
+                        Block::List(l) => self.list(l, &[&c.attrs]),
+                        Block::Table(t) => self.table(t, &[&c.attrs]),
+                        Block::BlockQuote(q) => {
+                            let alert;
+                            let mut lists: Vec<&Attributes<'_>> = Vec::new();
+                            if let Some(kind) = q.alert {
+                                alert = Attributes(vec![Attribute {
+                                    name: "as".into(),
+                                    value: kind.as_str().into(),
+                                }]);
+                                lists.push(&alert);
+                            }
+                            lists.push(&c.attrs);
+                            self.blockquote(&q.children, &lists)
+                        }
+                        Block::CodeBlock(code) => self.code_block(code, &[&c.attrs]),
+                        _ => unreachable!(),
+                    }
+                    return;
+                }
+            }
+        }
+        self.cr();
+        let mut lists: Vec<&Attributes<'_>> = Vec::with_capacity(2);
+        if let Some(a) = self.unwrapped_attrs(&c.children) {
+            lists.push(a);
+        }
+        lists.push(&c.attrs);
+        self.open_tag(name, &[], &lists);
+        if is_void(name) {
+            self.push("\n");
+            return;
+        }
+        self.push_scope(&c.attrs);
+        self.container(&c.children);
+        for slot in &c.slots {
+            self.cr();
+            let mut lists: Vec<&Attributes<'_>> = Vec::with_capacity(2);
+            if let Some(a) = self.unwrapped_attrs(&slot.children) {
+                lists.push(a);
+            }
+            lists.push(&slot.attrs);
+            self.open_tag("template", &[("name", &slot.name)], &lists);
+            self.container(&slot.children);
+            self.push("</template>\n");
+        }
+        self.scopes.pop();
+        self.push("</");
+        self.push(name);
+        self.push(">\n");
+    }
+
+    /// Whether a component must not be rendered at all.
+    fn blocked(&self, name: &str, attrs: &Attributes<'_>) -> bool {
+        self.opts.sanitize
+            && (is_blocked_tag(name)
+                || ["as", "is", ":as", ":is"]
+                    .iter()
+                    .filter_map(|k| attrs.get(k))
+                    .any(|v| is_blocked_tag(v.trim_matches('"'))))
     }
 
     fn raw_html(&mut self, html: &str) {
         match self.opts.raw_html {
-            RawHtml::Escape => escape_html(self.out, html),
+            RawHtml::Escape => {
+                if self.comark {
+                    escape_text(self.out, html)
+                } else {
+                    escape_html(self.out, html)
+                }
+            }
             RawHtml::Omit => self.push("<!-- raw HTML omitted -->"),
             RawHtml::Allow if self.opts.tagfilter => tagfilter(self.out, html),
             RawHtml::Allow => self.push(html),
@@ -257,37 +695,53 @@ impl Renderer<'_, '_> {
         }
     }
 
+    fn element(&mut self, tag: &str, attrs: &Attributes<'_>, children: &[Inline<'_>]) {
+        self.open_tag(tag, &[], &[attrs]);
+        self.inlines(children);
+        self.push("</");
+        self.push(tag);
+        self.push(">");
+    }
+
     fn inline(&mut self, inline: &Inline<'_>) {
         match inline {
-            Inline::Text(t) => escape_html(self.out, t),
+            Inline::Text(t) => self.text(t),
             Inline::SoftBreak => self.push("\n"),
-            Inline::HardBreak => self.push("<br />\n"),
-            Inline::Code(t) => {
-                self.push("<code>");
-                escape_html(self.out, t);
+            Inline::HardBreak => {
+                self.push("<br");
+                self.void_end();
+                self.push("\n");
+            }
+            Inline::Code(c) => {
+                self.open_tag("code", &[], &[&c.attrs]);
+                self.text(&c.literal);
                 self.push("</code>");
             }
             Inline::Html(h) => self.raw_html(h),
-            Inline::Emphasis(c) => {
-                self.push("<em>");
-                self.inlines(c);
-                self.push("</em>");
-            }
-            Inline::Strong(c) => {
-                self.push("<strong>");
-                self.inlines(c);
-                self.push("</strong>");
-            }
-            Inline::Strikethrough(c) => {
-                self.push("<del>");
-                self.inlines(c);
-                self.push("</del>");
+            Inline::Emphasis(e) => self.element("em", &e.attrs, &e.children),
+            Inline::Strong(e) => self.element("strong", &e.attrs, &e.children),
+            Inline::Strikethrough(e) => self.element("del", &e.attrs, &e.children),
+            Inline::Span(e) => self.element("span", &e.attrs, &e.children),
+            Inline::Component(c) => {
+                if self.blocked(&c.name, &c.attrs) {
+                    return;
+                }
+                self.open_tag(&c.name, &[], &[&c.attrs]);
+                if !is_void(&c.name) {
+                    self.push_scope(&c.attrs);
+                    self.inlines(&c.children);
+                    self.scopes.pop();
+                    self.push("</");
+                    self.push(&c.name);
+                    self.push(">");
+                }
             }
             Inline::Link(link) => {
                 self.push("<a href=\"");
                 self.url(&link.url, false);
                 self.push("\"");
                 self.title(link);
+                self.attrs("a", &[], &[&link.attrs]);
                 self.push(">");
                 self.inlines(&link.children);
                 self.push("</a>");
@@ -308,11 +762,21 @@ impl Renderer<'_, '_> {
             Inline::Image(link) => {
                 self.push("<img src=\"");
                 self.url(&link.url, true);
-                self.push("\" alt=\"");
-                alt_text(self.out, &link.children);
                 self.push("\"");
-                self.title(link);
-                self.push(" />");
+                if self.comark {
+                    self.title(link);
+                    self.push(" alt=\"");
+                    alt_text(self.out, &link.children);
+                    self.push("\"");
+                    self.attrs("img", &[], &[&link.attrs]);
+                    self.push(">");
+                } else {
+                    self.push(" alt=\"");
+                    alt_text(self.out, &link.children);
+                    self.push("\"");
+                    self.title(link);
+                    self.push(" />");
+                }
             }
         }
     }
@@ -332,12 +796,278 @@ impl Renderer<'_, '_> {
     }
 }
 
+fn no_dupes<'s>(mut names: impl Iterator<Item = &'s str>) -> bool {
+    let mut seen: [&str; 8] = [""; 8];
+    let mut n = 0;
+    names.all(|name| {
+        if seen[..n].contains(&name) || n == seen.len() {
+            return false;
+        }
+        seen[n] = name;
+        n += 1;
+        true
+    })
+}
+
+fn is_blocked_tag(tag: &str) -> bool {
+    BLOCKED_TAGS.iter().any(|t| t.eq_ignore_ascii_case(tag))
+}
+
+/// `^[a-zA-Z_:][a-zA-Z0-9_:.-]*$`: names that cannot break out of a tag.
+fn is_safe_attr_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    match b.split_first() {
+        Some((&c, rest)) => {
+            (c.is_ascii_alphabetic() || c == b'_' || c == b':')
+                && rest
+                    .iter()
+                    .all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b':' | b'.' | b'-'))
+        }
+        None => false,
+    }
+}
+
+/// The name of the DOM property an attribute writes, as Comark's security
+/// plugin computes it: lowercase, without binding prefixes and separators.
+fn normalize_attr_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let mut s = lower.as_str();
+    loop {
+        if let Some(rest) = s.strip_prefix("v-bind:") {
+            s = rest;
+        } else if let Some(rest) = s.strip_prefix([':', '.', '^']) {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    let on;
+    if let Some(rest) = s.strip_prefix('@').or_else(|| s.strip_prefix("v-on:")) {
+        on = format!("on{rest}");
+        s = &on;
+    }
+    s.chars()
+        .filter(|c| !matches!(c, ':' | '_' | '-'))
+        .collect()
+}
+
+/// Comark's security rules for one attribute.
+fn is_safe_attr(name: &str, value: &str) -> bool {
+    let n = normalize_attr_name(name);
+    if n.starts_with("on")
+        || n.ends_with("html")
+        || matches!(
+            n.as_str(),
+            "srcdoc" | "formaction" | "textcontent" | "visvnode"
+        )
+    {
+        return false;
+    }
+    // Browsers decode the character references kept by `escape_attr`, and
+    // renderers JSON-decode bindings: check what they will see.
+    let entities = decode_entities(value);
+    let json;
+    let value = match name
+        .starts_with(':')
+        .then(|| json_string(&entities))
+        .flatten()
+    {
+        Some(s) => {
+            json = s;
+            json.as_str()
+        }
+        None => &entities,
+    };
+    if n == "attributename" {
+        return !value.to_ascii_lowercase().contains("href");
+    }
+    if n == "as" || n == "is" {
+        let b = value.as_bytes();
+        return b.first().is_some_and(u8::is_ascii_alphabetic)
+            && b.iter()
+                .all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+            && !is_blocked_tag(value);
+    }
+    if n.ends_with("srcset") {
+        return value
+            .split(',')
+            .filter_map(|candidate| candidate.split_ascii_whitespace().next())
+            .all(|url| is_safe_url(url, true));
+    }
+    if n == "style" {
+        let compact: String = value
+            .chars()
+            .filter(|c| !c.is_whitespace() && !matches!(c, '\\' | '"' | '\''))
+            .flat_map(char::to_lowercase)
+            .collect();
+        return !(compact.contains("javascript:")
+            || compact.contains("vbscript:")
+            || compact.contains("expression(")
+            || compact.contains("url(data:text"));
+    }
+    let url_prop = matches!(
+        n.as_str(),
+        "to" | "action" | "poster" | "cite" | "background" | "ping" | "longdesc"
+    ) || ["href", "src", "url", "uri", "link"]
+        .iter()
+        .any(|s| n.ends_with(s) || n.strip_suffix('s').is_some_and(|m| m.ends_with(s)));
+    if url_prop {
+        return is_safe_url(value, n.ends_with("src") || n == "poster");
+    }
+    true
+}
+
+/// Decodes a JSON string literal (`"..."`), if `value` is one.
+fn json_string(value: &str) -> Option<String> {
+    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            'u' => {
+                let hex: String = chars.by_ref().take(4).collect();
+                out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+            }
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InfoPart {
+    Language,
+    Highlights,
+    Filename,
+    Meta,
+}
+
+/// A code block info string, read like Comark: a language, `{1-3,5}` line
+/// highlights and a `[filename]` in any order, and the rest as metadata.
+struct CodeInfo<'s> {
+    language: &'s str,
+    highlights: Vec<u32>,
+    filename: String,
+    meta: &'s str,
+    order: Vec<InfoPart>,
+}
+
+impl<'s> CodeInfo<'s> {
+    fn parse(info: &'s str) -> Self {
+        let mut ci = CodeInfo {
+            language: "",
+            highlights: Vec::new(),
+            filename: String::new(),
+            meta: "",
+            order: Vec::new(),
+        };
+        let mut rest = info.trim();
+        let lang_len = rest
+            .find(|c: char| c.is_whitespace() || "[{}\"'<>`".contains(c))
+            .unwrap_or(rest.len());
+        if lang_len > 0 {
+            ci.language = &rest[..lang_len];
+            ci.order.push(InfoPart::Language);
+            rest = rest[lang_len..].trim();
+        }
+        loop {
+            if let Some(body) = rest.strip_prefix('{') {
+                let Some(close) = body.find('}').filter(|&c| c > 0) else {
+                    break;
+                };
+                for part in body[..close].split(',') {
+                    let part = part.trim();
+                    if let Some((a, b)) = part.split_once('-') {
+                        if let (Some(a), Some(b)) = (parse_int(a), parse_int(b)) {
+                            if b.saturating_sub(a) <= 1000 {
+                                let mut i = a;
+                                while i <= b && ci.highlights.len() < 1000 {
+                                    ci.highlights.push(i);
+                                    i += 1;
+                                }
+                            }
+                        }
+                    } else if let Some(n) = parse_int(part) {
+                        if ci.highlights.len() < 1000 {
+                            ci.highlights.push(n);
+                        }
+                    }
+                }
+                if !ci.highlights.is_empty()
+                    && !ci.order.iter().any(|p| matches!(p, InfoPart::Highlights))
+                {
+                    ci.order.push(InfoPart::Highlights);
+                }
+                rest = body[close + 1..].trim();
+            } else if rest.starts_with('[') {
+                let mut depth = 0i32;
+                let mut end = None;
+                for (i, c) in rest.char_indices() {
+                    if c == '[' {
+                        depth += 1;
+                    } else if c == ']' {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                }
+                let Some(end) = end else { break };
+                ci.filename = rest[1..end].replace('\\', "");
+                if !ci.order.iter().any(|p| matches!(p, InfoPart::Filename)) {
+                    ci.order.push(InfoPart::Filename);
+                }
+                rest = rest[end + 1..].trim();
+            } else {
+                break;
+            }
+        }
+        if !rest.is_empty() {
+            ci.meta = rest;
+            ci.order.push(InfoPart::Meta);
+        }
+        ci
+    }
+
+    fn highlights_json(&self) -> String {
+        let mut s = String::from("[");
+        for (i, n) in self.highlights.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(itoa(*n, &mut [0; 10]));
+        }
+        s.push(']');
+        s
+    }
+}
+
+/// `Number.parseInt(s, 10)` for the non-negative numbers of line ranges.
+fn parse_int(s: &str) -> Option<u32> {
+    let s = s.trim();
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    s[..digits].parse().ok()
+}
+
 fn alt_text(out: &mut String, inlines: &[Inline<'_>]) {
     for inline in inlines {
         match inline {
-            Inline::Text(t) | Inline::Code(t) | Inline::Html(t) => escape_html(out, t),
+            Inline::Text(t) | Inline::Html(t) => escape_html(out, t),
+            Inline::Code(c) => escape_html(out, &c.literal),
             Inline::SoftBreak | Inline::HardBreak => out.push('\n'),
-            Inline::Emphasis(c) | Inline::Strong(c) | Inline::Strikethrough(c) => alt_text(out, c),
+            Inline::Emphasis(e)
+            | Inline::Strong(e)
+            | Inline::Strikethrough(e)
+            | Inline::Span(e) => alt_text(out, &e.children),
+            Inline::Component(c) => alt_text(out, &c.children),
             Inline::Link(l) | Inline::Image(l) => alt_text(out, &l.children),
             Inline::FootnoteReference(r) => {
                 out.push('[');
@@ -391,6 +1121,57 @@ pub fn escape_html(out: &mut String, s: &str) {
             b'<' => "&lt;",
             b'>' => "&gt;",
             b'"' => "&quot;",
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        out.push_str(&s[last..i]);
+        out.push_str(rep);
+        i += 1;
+        last = i;
+    }
+    out.push_str(&s[last..]);
+}
+
+/// Escapes text like Comark: `<` and `>`, and `&` where a browser could read
+/// it as the start of a character reference, so the text reads back as written.
+pub(crate) fn escape_text(out: &mut String, s: &str) {
+    escape_with(out, s, false)
+}
+
+/// Escapes an attribute value like Comark: `<`, `>`, `"`, and `&` except
+/// where it starts a character reference. The sanitizer checks values with
+/// those references decoded, as a browser will read them.
+pub(crate) fn escape_attr(out: &mut String, s: &str) {
+    escape_with(out, s, true)
+}
+
+fn escape_with(out: &mut String, s: &str, attr: bool) {
+    let b = s.as_bytes();
+    let mut last = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if i + 8 <= b.len() && !needs_escape(u64::from_le_bytes(b[i..i + 8].try_into().unwrap())) {
+            i += 8;
+            continue;
+        }
+        let rep = match b[i] {
+            b'<' => "&lt;",
+            b'>' => "&gt;",
+            b'"' if attr => "&quot;",
+            // In an attribute, a reference is kept only when the sanitizer
+            // decodes it the same way. In text, `&` is escaped wherever a
+            // browser could read a reference.
+            b'&' if if attr {
+                parse_entity(&s[i..]).is_none()
+            } else {
+                b.get(i + 1)
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'#')
+            } =>
+            {
+                "&amp;"
+            }
             _ => {
                 i += 1;
                 continue;

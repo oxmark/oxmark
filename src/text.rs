@@ -96,6 +96,32 @@ pub(crate) fn parse_entity(s: &str) -> Option<(Cow<'static, str>, usize)> {
     }
 }
 
+/// Decodes the character references that [`parse_entity`] accepts, as a
+/// browser would in an attribute value written by the renderer.
+pub(crate) fn decode_entities(s: &str) -> Cow<'_, str> {
+    if !s.contains('&') {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        match parse_entity(rest) {
+            Some((text, len)) => {
+                out.push_str(&text);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
 /// Resolves backslash escapes and entities, as in link destinations, titles
 /// and info strings.
 pub(crate) fn unescape(s: &str) -> Cow<'_, str> {

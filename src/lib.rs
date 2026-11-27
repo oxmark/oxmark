@@ -1,9 +1,10 @@
 //! A fast Rust implementation of Comark (Markdown with components).
 //!
-//! The parser currently implements [CommonMark 0.31.2] and the
-//! [GitHub Flavored Markdown] extensions (tables, strikethrough, task lists
-//! and extended autolinks), plus Comark's heading ids and footnotes. Comark
-//! components come next.
+//! The parser implements [CommonMark 0.31.2], the [GitHub Flavored Markdown]
+//! extensions (tables, strikethrough, task lists and extended autolinks) and
+//! the Comark syntax: block and inline components with props and slots,
+//! spans, attributes, frontmatter, alerts, heading ids and footnotes. Raw
+//! HTML is not parsed into elements yet.
 //!
 //! ```
 //! let html = oxmark::to_html("Hello *world* <script>alert(1)</script>");
@@ -16,9 +17,10 @@
 //! # Security
 //!
 //! The default [`HtmlOptions`] are safe for untrusted input: raw HTML is
-//! escaped and URLs with a dangerous scheme (`javascript:`, `vbscript:`,
-//! `file:`, non-image `data:`) are dropped. Text and attributes are always
-//! escaped.
+//! escaped, URLs with a dangerous scheme (`javascript:`, `vbscript:`,
+//! `file:`, non-image `data:`) are dropped, component and attribute props go
+//! through Comark's security rules, and components such as `script` or
+//! `iframe` are dropped. Text and attributes are always escaped.
 //!
 //! [CommonMark 0.31.2]: https://spec.commonmark.org/0.31.2/
 //! [GitHub Flavored Markdown]: https://github.github.com/gfm/
@@ -31,14 +33,17 @@ mod autolink;
 mod block;
 mod html;
 mod inline;
+mod props;
 mod scan;
 mod slug;
 mod tables;
 mod text;
+mod yaml;
 
 pub use ast::Document;
 pub use html::{
-    escape_href, escape_html, is_safe_url, render_html, render_html_to, HtmlOptions, RawHtml,
+    escape_href, escape_html, is_safe_url, render_html, render_html_to, HtmlOptions, HtmlStyle,
+    RawHtml,
 };
 
 /// Parsing options: which syntax extensions are enabled.
@@ -56,17 +61,41 @@ pub struct Options {
     /// Heading ids computed from the heading text, like Comark does
     /// (`## Hello World` gets `id="hello-world"`, repeats get `-1`, `-2`...).
     pub heading_ids: bool,
+    /// Nested heading ids, like Comark's `headingIds: 'nested'`: a heading
+    /// id starts with the id of the enclosing section heading (`h2` or
+    /// deeper), so `## Setup` then `### Install` gives `setup-install`.
+    pub nested_heading_ids: bool,
     /// Footnotes: `[^label]` references and single-line `[^label]: text`
     /// definitions, rendered like Comark's footnotes plugin.
     pub footnotes: bool,
+    /// Comark components: block components (`::name` ... `::`) with props
+    /// and slots, inline components (`:name[content]`) and spans (`[text]`).
+    ///
+    /// Like in Comark, a `[text]` that is not followed by `(` or `[` is a
+    /// span, so shortcut reference links (`[label]` alone) are not links.
+    pub components: bool,
+    /// Comark attributes: `{.class #id key="value"}` after an inline element
+    /// or at the end of a paragraph, heading or list item.
+    pub attributes: bool,
+    /// YAML frontmatter between `---` lines at the start of the document. It
+    /// is kept in [`Document::frontmatter`] instead of being rendered.
+    pub frontmatter: bool,
+    /// GFM alerts: a block quote starting with `[!NOTE]`, `[!TIP]`,
+    /// `[!IMPORTANT]`, `[!WARNING]` or `[!CAUTION]`.
+    pub alerts: bool,
 }
 
 impl Default for Options {
-    /// The Comark defaults: every GFM extension and heading ids. Footnotes
-    /// are off, as in Comark where they come from an optional plugin.
+    /// The Comark defaults: every GFM extension, heading ids, components,
+    /// attributes and frontmatter. Footnotes are off, as in Comark where they
+    /// come from an optional plugin.
     fn default() -> Self {
         Options {
             heading_ids: true,
+            components: true,
+            attributes: true,
+            frontmatter: true,
+            alerts: true,
             ..Options::gfm()
         }
     }
@@ -81,25 +110,28 @@ impl Options {
             tasklists: false,
             autolinks: false,
             heading_ids: false,
+            nested_heading_ids: false,
             footnotes: false,
+            components: false,
+            attributes: false,
+            frontmatter: false,
+            alerts: false,
         }
     }
 
-    /// CommonMark with every GFM extension, without heading ids or
-    /// footnotes.
+    /// CommonMark with every GFM extension, without any Comark extension.
     pub const fn gfm() -> Self {
         Options {
             tables: true,
             strikethrough: true,
             tasklists: true,
             autolinks: true,
-            heading_ids: false,
-            footnotes: false,
+            ..Options::commonmark()
         }
     }
 }
 
-/// Parses Markdown with the default options (GFM and heading ids).
+/// Parses Markdown with the default options (the Comark syntax).
 pub fn parse(input: &str) -> Document<'_> {
     parse_with(input, &Options::default())
 }

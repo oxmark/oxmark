@@ -168,7 +168,29 @@ struct Fence {
 }
 
 #[derive(Debug)]
-enum Kind {
+struct ComponentData<'a> {
+    /// The number of colons of the opening marker.
+    count: usize,
+    /// The indentation of the opening marker, in columns from the start of
+    /// the content of its container. Lines inside lose up to that much.
+    indent: usize,
+    /// The indentation removed from the last line outside a code fence;
+    /// lines inside a fence lose what its opening line lost.
+    shift: usize,
+    name: Cow<'a, str>,
+    attrs: ast::Attributes<'a>,
+    /// The opener started its line, so Comark sees it when matching closers.
+    own_line: bool,
+}
+
+#[derive(Debug)]
+struct SlotData<'a> {
+    name: Cow<'a, str>,
+    attrs: ast::Attributes<'a>,
+}
+
+#[derive(Debug)]
+enum Kind<'a> {
     Document,
     BlockQuote,
     List(ListData),
@@ -179,6 +201,10 @@ enum Kind {
     CodeBlock(Fence),
     HtmlBlock(u8),
     Table(Box<TableHead>),
+    Component(Box<ComponentData<'a>>),
+    Slot(Box<SlotData<'a>>),
+    /// A YAML props block of a component, ended by this exact line.
+    Props(&'static str),
 }
 
 #[derive(Debug)]
@@ -189,8 +215,8 @@ struct TableHead {
 }
 
 #[derive(Debug)]
-struct Node {
-    kind: Kind,
+struct Node<'a> {
+    kind: Kind<'a>,
     depth: u16,
     parent: usize,
     children: Vec<usize>,
@@ -215,7 +241,7 @@ enum Start {
 pub(crate) struct BlockParser<'a, 'o> {
     src: &'a str,
     opts: &'o Options,
-    nodes: Vec<Node>,
+    nodes: Vec<Node<'a>>,
     refs: RefMap<'a>,
     tip: usize,
     old_tip: usize,
@@ -237,6 +263,9 @@ pub(crate) struct BlockParser<'a, 'o> {
     scratch: RefCell<inline::Scratch<'a>>,
     footnote_defs: HashMap<String, Cow<'a, str>>,
     heading_ids: RefCell<HeadingIds>,
+    /// Position from which a closing line was searched in vain, for each
+    /// kind of props block, so the searches stay linear.
+    props_unclosed: [usize; 3],
 }
 
 impl<'a, 'o> BlockParser<'a, 'o> {
@@ -276,6 +305,7 @@ impl<'a, 'o> BlockParser<'a, 'o> {
             scratch: RefCell::default(),
             footnote_defs: HashMap::new(),
             heading_ids: RefCell::default(),
+            props_unclosed: [usize::MAX; 3],
         }
     }
 
@@ -283,6 +313,13 @@ impl<'a, 'o> BlockParser<'a, 'o> {
         let src = self.src;
         let b = src.as_bytes();
         let mut start = 0;
+        let mut frontmatter = None;
+        if self.opts.frontmatter {
+            if let Some((yaml, end)) = split_frontmatter(src) {
+                frontmatter = Some(Cow::Borrowed(yaml));
+                start = end;
+            }
+        }
         let has_cr = src.contains('\r');
         while start < b.len() {
             let end = if has_cr {
@@ -308,6 +345,7 @@ impl<'a, 'o> BlockParser<'a, 'o> {
         let children = self.convert_children(0);
         let footnotes = self.convert_footnotes();
         ast::Document {
+            frontmatter,
             children,
             footnotes,
         }
@@ -388,13 +426,16 @@ impl<'a, 'o> BlockParser<'a, 'o> {
 
     fn can_contain(parent: &Kind, child: &Kind) -> bool {
         match parent {
-            Kind::Document | Kind::BlockQuote | Kind::Item(_) => !matches!(child, Kind::Item(_)),
+            Kind::Document | Kind::BlockQuote | Kind::Item(_) | Kind::Slot(_) => {
+                !matches!(child, Kind::Item(_) | Kind::Slot(_))
+            }
+            Kind::Component(_) => !matches!(child, Kind::Item(_)),
             Kind::List(_) => matches!(child, Kind::Item(_)),
             _ => false,
         }
     }
 
-    fn add_child(&mut self, kind: Kind) -> usize {
+    fn add_child(&mut self, kind: Kind<'a>) -> usize {
         while !Self::can_contain(&self.nodes[self.tip].kind, &kind) {
             self.finalize(self.tip, self.line_number - 1);
         }
@@ -458,6 +499,7 @@ impl<'a, 'o> BlockParser<'a, 'o> {
                     .map_or(node.start_line, |&c| self.nodes[c].end_line);
                 self.nodes[idx].end_line = end;
             }
+            Kind::Props(_) => self.apply_props(idx),
             Kind::List(_) => {
                 let tight = self.list_is_tight(idx);
                 let node = &mut self.nodes[idx];
@@ -615,7 +657,11 @@ impl<'a, 'o> BlockParser<'a, 'o> {
     fn accepts_lines(&self, idx: usize) -> bool {
         matches!(
             self.nodes[idx].kind,
-            Kind::Paragraph | Kind::CodeBlock(_) | Kind::HtmlBlock(_) | Kind::Table(_)
+            Kind::Paragraph
+                | Kind::CodeBlock(_)
+                | Kind::HtmlBlock(_)
+                | Kind::Table(_)
+                | Kind::Props(_)
         )
     }
 
@@ -624,14 +670,55 @@ impl<'a, 'o> BlockParser<'a, 'o> {
         match c {
             Some(b'#' | b'`' | b'~' | b'*' | b'+' | b'_' | b'=' | b'<' | b'>' | b'-') => true,
             Some(b'0'..=b'9') => true,
-            Some(b'|' | b':') => self.opts.tables,
+            Some(b'|') => self.opts.tables,
+            Some(b':') => self.opts.tables || self.opts.components,
             _ => false,
         }
     }
 
     fn continue_block(&mut self, idx: usize) -> Continue {
         match self.nodes[idx].kind {
-            Kind::Document | Kind::List(_) => Continue::Matched,
+            Kind::Document | Kind::List(_) | Kind::Slot(_) => Continue::Matched,
+            Kind::Component(ref d) => {
+                let (count, indent, shift) = (d.count, d.indent, d.shift);
+                // Inside a fenced code block, only the fence can close.
+                let mut in_fence =
+                    matches!(self.nodes[self.tip].kind, Kind::CodeBlock(f) if f.fenced);
+                // A line left of the list item holding the fence ends both.
+                if in_fence && !self.blank {
+                    if let Some(item) = self.first_open_item(idx) {
+                        if self.indent < shift + item {
+                            in_fence = false;
+                        }
+                    }
+                }
+                if !in_fence && !self.indented {
+                    if let Some(n) = bare_marker(&self.line.as_bytes()[self.next_nonspace..]) {
+                        if n == count && !self.nested_component(idx, n) {
+                            while self.tip != idx {
+                                self.finalize(self.tip, self.line_number);
+                            }
+                            self.finalize(idx, self.line_number);
+                            return Continue::Consumed;
+                        }
+                    }
+                }
+                let n = self.indent.min(if in_fence { shift } else { indent });
+                if !in_fence {
+                    if let Kind::Component(d) = &mut self.nodes[idx].kind {
+                        d.shift = n;
+                    }
+                }
+                self.advance_offset(n, true);
+                Continue::Matched
+            }
+            Kind::Props(closer) => {
+                if self.line.get(self.offset..) == Some(closer) {
+                    self.finalize(idx, self.line_number);
+                    return Continue::Consumed;
+                }
+                Continue::Matched
+            }
             Kind::BlockQuote => {
                 if !self.indented && self.byte(self.next_nonspace) == Some(b'>') {
                     self.advance_next_nonspace();
@@ -706,6 +793,14 @@ impl<'a, 'o> BlockParser<'a, 'o> {
         let c = self.byte(self.next_nonspace);
         let too_deep = self.nodes[container].depth >= MAX_BLOCK_DEPTH;
         if !self.indented {
+            // Slots and YAML props come before headings and code fences.
+            if self.opts.components && matches!(c, Some(b'#' | b'-' | b'`' | b'~')) {
+                if let s @ (Start::Leaf | Start::Container) =
+                    self.start_component_part(container, c)
+                {
+                    return s;
+                }
+            }
             match c {
                 Some(b'>') if !too_deep => return self.start_block_quote(),
                 Some(b'#') => {
@@ -723,8 +818,15 @@ impl<'a, 'o> BlockParser<'a, 'o> {
                         return s;
                     }
                 }
+                Some(b':') if self.opts.components => {
+                    match self.start_component(container, too_deep) {
+                        Start::None => {}
+                        s => return s,
+                    }
+                }
                 _ => {}
             }
+
             if self.opts.tables {
                 if let s @ Start::Leaf = self.start_table(container) {
                     return s;
@@ -758,6 +860,208 @@ impl<'a, 'o> BlockParser<'a, 'o> {
             return Start::Leaf;
         }
         Start::None
+    }
+
+    /// `::name[content]{props}` opens a block component; `:name{props}` alone
+    /// on its line is a component without content.
+    fn start_component(&mut self, container: usize, too_deep: bool) -> Start {
+        let line = self.line;
+        let rest = &line.as_bytes()[self.next_nonspace..];
+        let count = rest.iter().take_while(|&&c| c == b':').count();
+        let after = &line[self.next_nonspace + count..];
+        let name_start = after.trim_start_matches([' ', '\t']);
+        if !name_start
+            .as_bytes()
+            .first()
+            .is_some_and(|&c| c.is_ascii_alphabetic() || c == b'$')
+        {
+            return Start::None;
+        }
+        let Some(params) = parse_block_params(self.src, after) else {
+            return Start::None;
+        };
+        if count == 1 {
+            // The shorthand neither interrupts a paragraph nor takes text after it.
+            if params.remaining || matches!(self.nodes[container].kind, Kind::Paragraph) {
+                return Start::None;
+            }
+        } else if too_deep {
+            return Start::None;
+        }
+        let own_line = self.next_nonspace == 0
+            || line.as_bytes()[..self.next_nonspace]
+                .iter()
+                .all(|&c| is_space_or_tab(c))
+            || matches!(
+                self.nodes[container].kind,
+                Kind::Component(_) | Kind::Slot(_)
+            );
+        let indent = self.indent;
+        self.advance_next_nonspace();
+        self.offset = line.len();
+        self.close_unmatched_blocks();
+        let idx = self.add_child(Kind::Component(Box::new(ComponentData {
+            count,
+            indent,
+            shift: 0,
+            name: params.name,
+            attrs: params.attrs,
+            own_line,
+        })));
+        if let Some(content) = params.content {
+            let p = self.add_child(Kind::Paragraph);
+            self.nodes[p].content.push_line(self.src, content, 0);
+            self.finalize(p, self.line_number);
+        }
+        if count == 1 {
+            self.finalize(idx, self.line_number);
+            self.line_consumed = true;
+            return Start::Leaf;
+        }
+        Start::Container
+    }
+
+    /// Starts a slot (`#name`) or a YAML props block inside a component.
+    fn start_component_part(&mut self, container: usize, c: Option<u8>) -> Start {
+        // The component (or slot) the line is in, through an open paragraph.
+        let mut owner = container;
+        if matches!(self.nodes[owner].kind, Kind::Paragraph) {
+            owner = self.nodes[owner].parent;
+        }
+        let component = match self.nodes[owner].kind {
+            Kind::Component(_) => owner,
+            Kind::Slot(_) => self.nodes[owner].parent,
+            _ => return Start::None,
+        };
+        let line = self.line;
+        let rest = &line[self.next_nonspace..];
+        match c {
+            Some(b'#') => {
+                let b = rest.as_bytes();
+                if matches!(b.get(1), None | Some(b' ' | b'#')) {
+                    return Start::None;
+                }
+                let params = &rest[1..];
+                if !params
+                    .trim_start()
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|&c| c.is_ascii_alphabetic() || c == b'$')
+                {
+                    return Start::None;
+                }
+                let Some(p) = parse_block_params(self.src, params) else {
+                    return Start::None;
+                };
+                if p.remaining || p.content.is_some() {
+                    return Start::None;
+                }
+                self.close_unmatched_blocks();
+                while self.tip != component {
+                    self.finalize(self.tip, self.line_number - 1);
+                }
+                self.add_child(Kind::Slot(Box::new(SlotData {
+                    name: p.name,
+                    attrs: p.attrs,
+                })));
+                self.offset = line.len();
+                Start::Container
+            }
+            Some(b'-' | b'`' | b'~') => {
+                let (closer, kind) = match rest {
+                    "---" => ("---", 0),
+                    "```yaml [props]" | "```yml [props]" => ("```", 1),
+                    "~~~yaml [props]" | "~~~yml [props]" => ("~~~", 2),
+                    _ => return Start::None,
+                };
+                if owner != component {
+                    return Start::None;
+                }
+                // `---` is props only right after the opening line.
+                if kind == 0
+                    && (self.nodes[component].start_line + 1 != self.line_number
+                        || !self.nodes[component].children.is_empty())
+                {
+                    return Start::None;
+                }
+                let line_end = line.as_ptr() as usize - self.src.as_ptr() as usize + line.len();
+                if line_end >= self.props_unclosed[kind] {
+                    return Start::None;
+                }
+                if !has_closing_line(&self.src[line_end..], self.next_nonspace, closer) {
+                    self.props_unclosed[kind] = line_end;
+                    return Start::None;
+                }
+                self.close_unmatched_blocks();
+                self.add_child(Kind::Props(closer));
+                self.advance_next_nonspace();
+                self.offset = line.len();
+                self.line_consumed = true;
+                Start::Leaf
+            }
+            _ => Start::None,
+        }
+    }
+
+    /// The content offset of the first open list item inside component
+    /// `idx`, if any.
+    fn first_open_item(&self, idx: usize) -> Option<usize> {
+        let mut n = idx;
+        while let Some(&last) = self.nodes[n].children.last() {
+            if !self.nodes[last].open {
+                return None;
+            }
+            n = last;
+            match &self.nodes[n].kind {
+                Kind::Item(d) => return Some(d.marker_offset + d.padding),
+                Kind::List(_) | Kind::Slot(_) => {}
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Whether an open component inside `idx` uses the same closing marker.
+    fn nested_component(&self, idx: usize, count: usize) -> bool {
+        let mut n = idx;
+        while let Some(&last) = self.nodes[n].children.last() {
+            if !self.nodes[last].open {
+                break;
+            }
+            n = last;
+            match &self.nodes[n].kind {
+                Kind::Component(d) => {
+                    if d.own_line && d.count == count {
+                        return true;
+                    }
+                }
+                Kind::Slot(_) | Kind::List(_) | Kind::Item(_) => {}
+                _ => break,
+            }
+        }
+        false
+    }
+
+    /// Merges a finished YAML props block into its component.
+    fn apply_props(&mut self, idx: usize) {
+        let parent = self.nodes[idx].parent;
+        self.unlink(idx);
+        let yaml = self.nodes[idx].content.text(self.src);
+        let Ok(Some(crate::yaml::Value::Object(entries))) = crate::yaml::parse(yaml) else {
+            return;
+        };
+        let Kind::Component(d) = &mut self.nodes[parent].kind else {
+            return;
+        };
+        for (key, value) in entries {
+            match value {
+                crate::yaml::Value::String(s) => d.attrs.set(Cow::Owned(key), Cow::Owned(s)),
+                v if key == "class" => d.attrs.set(Cow::Owned(key), Cow::Owned(v.to_json())),
+                v => d
+                    .attrs
+                    .set(Cow::Owned(format!(":{key}")), Cow::Owned(v.to_json())),
+            }
+        }
     }
 
     fn start_block_quote(&mut self) -> Start {
@@ -1067,30 +1371,64 @@ impl<'a, 'o> BlockParser<'a, 'o> {
         )
     }
 
+    /// Inline content of a block, with the attributes of a trailing `{...}`.
+    fn block_inlines(&self, text: &str) -> (Vec<Inline<'a>>, ast::Attributes<'a>) {
+        inline::parse_block(
+            self.src,
+            text,
+            &self.refs,
+            self.opts,
+            &mut self.scratch.borrow_mut(),
+        )
+    }
+
+    fn paragraph(&self, text: &str) -> Block<'a> {
+        let (children, attrs) = self.block_inlines(text);
+        Block::Paragraph(ast::Paragraph { attrs, children })
+    }
+
     fn convert(&self, idx: usize) -> Block<'a> {
         let node = &self.nodes[idx];
         let src = self.src;
         match &node.kind {
             Kind::Paragraph => {
                 let text = node.content.text(src).trim_matches(is_ascii_ws_char);
-                Block::Paragraph(self.inlines(text))
+                self.paragraph(text)
             }
             Kind::Heading(level) => {
                 let text = node.content.text(src).trim_matches(is_ascii_ws_char);
-                let children = self.inlines(text);
-                let id = if self.opts.heading_ids {
-                    self.heading_ids.borrow_mut().next(&children)
-                } else {
-                    None
+                let (children, mut attrs) = self.block_inlines(text);
+                let custom = match attrs.0.iter().position(|a| a.name == "id") {
+                    Some(i) => Some(attrs.0.remove(i).value),
+                    None => None,
                 };
+                let mut id = None;
+                if self.opts.heading_ids {
+                    let mut ids = self.heading_ids.borrow_mut();
+                    id = ids
+                        .next(&children, *level, self.opts.nested_heading_ids)
+                        .map(Cow::Owned);
+                    if let Some(custom) = &custom {
+                        ids.reserve(custom);
+                    }
+                }
                 Block::Heading(ast::Heading {
                     level: *level,
-                    id,
+                    id: custom.or(id),
+                    attrs,
                     children,
                 })
             }
             Kind::ThematicBreak => Block::ThematicBreak,
-            Kind::BlockQuote => Block::BlockQuote(self.convert_children(idx)),
+            Kind::BlockQuote => {
+                let mut children = self.convert_children(idx);
+                let alert = if self.opts.alerts {
+                    take_alert(&mut children)
+                } else {
+                    None
+                };
+                Block::BlockQuote(ast::BlockQuote { alert, children })
+            }
             Kind::List(d) => {
                 let kind = if d.bullet != 0 {
                     ast::ListKind::Bullet(d.bullet)
@@ -1100,11 +1438,19 @@ impl<'a, 'o> BlockParser<'a, 'o> {
                         delimiter: d.delimiter,
                     }
                 };
-                let items = node
+                let mut items: Vec<ast::ListItem<'a>> = node
                     .children
                     .iter()
                     .map(|&item| self.convert_item(item))
                     .collect();
+                if d.tight {
+                    // The attributes of a tight paragraph belong to its item.
+                    for item in &mut items {
+                        if let Some(Block::Paragraph(p)) = item.children.first_mut() {
+                            item.attrs = std::mem::take(&mut p.attrs);
+                        }
+                    }
+                }
                 Block::List(ast::List {
                     kind,
                     tight: d.tight,
@@ -1132,6 +1478,27 @@ impl<'a, 'o> BlockParser<'a, 'o> {
                 Block::HtmlBlock(to_cow(src, &text[..end]))
             }
             Kind::Table(head) => self.convert_table(node, head),
+            Kind::Component(d) => {
+                let mut children = Vec::new();
+                let mut slots = Vec::new();
+                for &c in &node.children {
+                    match &self.nodes[c].kind {
+                        Kind::Slot(s) => slots.push(ast::Slot {
+                            name: s.name.clone(),
+                            attrs: s.attrs.clone(),
+                            children: self.convert_children(c),
+                        }),
+                        _ => children.push(self.convert(c)),
+                    }
+                }
+                Block::Component(ast::Component {
+                    name: d.name.clone(),
+                    attrs: d.attrs.clone(),
+                    children,
+                    slots,
+                })
+            }
+            Kind::Slot(_) | Kind::Props(_) => unreachable!("converted by their parent"),
         }
     }
 
@@ -1151,13 +1518,17 @@ impl<'a, 'o> BlockParser<'a, 'o> {
                 {
                     task = Some(b[1] != b' ');
                     let rest = text[4..].trim_matches(is_ascii_ws_char);
-                    children.push(Block::Paragraph(self.inlines(rest)));
+                    children.push(self.paragraph(rest));
                     continue;
                 }
             }
             children.push(self.convert(c));
         }
-        ast::ListItem { task, children }
+        ast::ListItem {
+            task,
+            attrs: ast::Attributes::default(),
+            children,
+        }
     }
 
     fn convert_code(&self, node: &Node, f: &Fence) -> Block<'a> {
@@ -1479,4 +1850,200 @@ fn html_block_end(t: u8, line: &[u8]) -> bool {
         5 => contains(b"]]>"),
         _ => false,
     }
+}
+
+/// The number of colons of a line made only of 2 or more colons (and
+/// trailing whitespace).
+fn bare_marker(rest: &[u8]) -> Option<usize> {
+    let n = rest.iter().take_while(|&&c| c == b':').count();
+    (n >= 2 && rest[n..].iter().all(|&c| is_space_or_tab(c))).then_some(n)
+}
+
+/// Whether a line of `text` (after `prefix` bytes) is exactly `closer`.
+fn has_closing_line(text: &str, prefix: usize, closer: &str) -> bool {
+    text.split('\n')
+        .skip(1)
+        .any(|l| l.strip_suffix('\r').unwrap_or(l).get(prefix..) == Some(closer))
+}
+
+struct BlockParams<'a> {
+    name: Cow<'a, str>,
+    content: Option<&'a str>,
+    attrs: ast::Attributes<'a>,
+    /// Text that is neither content nor props follows.
+    remaining: bool,
+}
+
+/// Parses `name [content] {props}`, like Comark's `parseBlockParams`. The
+/// name is converted to kebab-case.
+fn parse_block_params<'a>(src: &'a str, s: &'a str) -> Option<BlockParams<'a>> {
+    let s = s.trim();
+    let b = s.as_bytes();
+    if !b
+        .first()
+        .is_some_and(|&c| c.is_ascii_alphabetic() || c == b'$')
+    {
+        return None;
+    }
+    let name_len = b
+        .iter()
+        .take_while(|&&c| c.is_ascii_alphanumeric() || matches!(c, b'$' | b'_' | b'.' | b'-'))
+        .count();
+    let name = kebab_case(&s[..name_len]);
+    let mut rest = s[name_len..].trim();
+    let mut content = None;
+    if rest.starts_with('[') {
+        if let Some(close) = closing_bracket(rest) {
+            content = Some(&rest[1..close]);
+            rest = rest[close + 1..].trim();
+        }
+    }
+    let mut attrs = ast::Attributes::default();
+    let mut remaining = false;
+    if rest.starts_with('{') {
+        if let Some(props) = crate::props::search(src, rest, 0) {
+            attrs = props.attrs;
+            remaining = !rest[props.end..].trim().is_empty();
+        }
+    } else {
+        remaining = !rest.is_empty();
+    }
+    Some(BlockParams {
+        name: to_cow_name(src, name),
+        content,
+        attrs,
+        remaining,
+    })
+}
+
+fn to_cow_name<'a>(src: &'a str, name: Cow<'_, str>) -> Cow<'a, str> {
+    lift(src, name)
+}
+
+/// The `]` closing the `[` at the start of `s`, skipping escapes and nested
+/// pairs.
+pub(crate) fn closing_bracket(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut depth = 0;
+    let mut i = 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'[' => depth += 1,
+            b']' if depth == 0 => return Some(i),
+            b']' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Converts a name to kebab-case like Comark (scule's `kebabCase`):
+/// `MyComponent` gives `my-component`, `HTMLParser` gives `html-parser`.
+fn kebab_case(name: &str) -> Cow<'_, str> {
+    let b = name.as_bytes();
+    if !b
+        .iter()
+        .any(|c| c.is_ascii_uppercase() || matches!(c, b'_' | b'.' | b'/'))
+    {
+        return Cow::Borrowed(name);
+    }
+    let mut out = String::with_capacity(name.len() + 4);
+    let chars: Vec<char> = name.chars().collect();
+    let mut word = false;
+    for (i, &c) in chars.iter().enumerate() {
+        if matches!(c, '-' | '_' | '.' | '/') {
+            word = false;
+            continue;
+        }
+        let split = c.is_uppercase()
+            && i > 0
+            && (chars[i - 1].is_lowercase()
+                || chars[i - 1].is_ascii_digit()
+                || (chars[i - 1].is_uppercase()
+                    && chars.get(i + 1).is_some_and(|n| n.is_lowercase())));
+        if (split || !word) && !out.is_empty() {
+            out.push('-');
+        }
+        word = true;
+        out.extend(c.to_lowercase());
+    }
+    Cow::Owned(out)
+}
+
+/// Finds leading YAML frontmatter like Comark: the document starts with
+/// `---` and a later line is `---`. Returns the YAML and where the Markdown
+/// starts.
+fn split_frontmatter(src: &str) -> Option<(&str, usize)> {
+    let start = if src.starts_with('\u{FEFF}') { 3 } else { 0 };
+    if !src[start..].starts_with("---") {
+        return None;
+    }
+    let b = src.as_bytes();
+    let mut from = start;
+    while let Some(p) = src[from..].find("\n---") {
+        let idx = from + p;
+        let mut end = idx + 4;
+        while end < b.len() && matches!(b[end], b' ' | b'\t') {
+            end += 1;
+        }
+        if b.get(end) == Some(&b'\r') {
+            end += 1;
+        }
+        if end == b.len() || b[end] == b'\n' {
+            let yaml_end = if idx > 0 && b[idx - 1] == b'\r' {
+                idx - 1
+            } else {
+                idx
+            };
+            let yaml = src.get(start + 4..yaml_end).unwrap_or("");
+            if yaml.is_empty() {
+                return None;
+            }
+            return Some((yaml, (end + 1).min(b.len())));
+        }
+        from = idx + 1;
+    }
+    None
+}
+
+/// Removes a leading GFM alert marker (`[!NOTE]`) from a block quote.
+fn take_alert(children: &mut [Block<'_>]) -> Option<ast::AlertKind> {
+    let Some(Block::Paragraph(p)) = children.first_mut() else {
+        return None;
+    };
+    let kind = match p.children.first_mut()? {
+        Inline::Span(span) if span.attrs.is_empty() => match span.children.as_slice() {
+            [Inline::Text(t)] => ast::AlertKind::from_marker(t)?,
+            _ => return None,
+        },
+        Inline::Text(t) => {
+            let rest = t.strip_prefix('[')?;
+            let end = rest.find(']')?;
+            let kind = ast::AlertKind::from_marker(&rest[..end])?;
+            if !rest[end + 1..].trim_start_matches([' ', '\t']).is_empty() {
+                return None;
+            }
+            kind
+        }
+        _ => return None,
+    };
+    p.children.remove(0);
+    if matches!(
+        p.children.first(),
+        Some(Inline::SoftBreak | Inline::HardBreak)
+    ) {
+        p.children.remove(0);
+    }
+    if let Some(Inline::Text(t)) = p.children.first_mut() {
+        let trimmed = t.trim_start();
+        if trimmed.len() != t.len() {
+            *t = match t {
+                Cow::Borrowed(s) => Cow::Borrowed(s.trim_start()),
+                Cow::Owned(s) => Cow::Owned(s.trim_start().to_owned()),
+            };
+        }
+    }
+    Some(kind)
 }
