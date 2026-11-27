@@ -2,11 +2,16 @@
 name = "oxmark"
 version = "0.0.0"
 edition = "2021"
+rust-version = "1.87"
 license = "Apache-2.0"
 description = "A fast Rust implementation of Comark (Markdown with components)."
 repository = "https://github.com/oxmark/oxmark"
 readme = "README.md"
-keywords = ["markdown", "comark", "parser"]
+exclude = ["/scripts", "/tests/fixtures"]
+keywords = ["markdown", "commonmark", "gfm", "comark", "parser"]
 categories = ["parser-implementations", "text-processing"]
 
 [dependencies]
+
+[dev-dependencies]
+serde_json = "1.0.154"

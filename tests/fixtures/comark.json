@@ -1,0 +1,32 @@
+[
+ {
+  "name": "heading ids",
+  "markdown": "## Hello World\n\n## Hello World\n\n## hello-world-1\n\n## Hello World\n\n## Hello *World* `x`\n\n## C++ / C#\n\n## snake_case 2nd\n\n## 日本語 テキスト\n\n## Emoji 😀 rocks\n\n## --lead--\n\n## Ünïcödé Ça\n\n## 42\n\n## a---b\n\n## Déjà vu‼\n\n## x²\n\n## Ⅻ roman\n\n## ![img](a.png) text\n\n## `code`\n\n## ---\n\n## [Link](http://x) **bold**\n\n## Ça va ? Oui !\n\n## under_score__x\n\n## Ölçü 3.5\n",
+  "footnotes": false,
+  "html": "<h2 id=\"hello-world\">Hello World</h2>\n<h2 id=\"hello-world-1\">Hello World</h2>\n<h2 id=\"hello-world-1-1\">hello-world-1</h2>\n<h2 id=\"hello-world-2\">Hello World</h2>\n<h2 id=\"hello-world-x\">Hello <em>World</em> <code>x</code></h2>\n<h2 id=\"c-c\">C++ / C#</h2>\n<h2 id=\"snake_case-2nd\">snake_case 2nd</h2>\n<h2 id=\"日本語-テキスト\">日本語 テキスト</h2>\n<h2 id=\"emoji-rocks\">Emoji 😀 rocks</h2>\n<h2 id=\"lead\">--lead--</h2>\n<h2 id=\"ünïcödé-ça\">Ünïcödé Ça</h2>\n<h2 id=\"_42\">42</h2>\n<h2 id=\"a-b\">a---b</h2>\n<h2 id=\"déjà-vu\">Déjà vu‼</h2>\n<h2 id=\"x\">x²</h2>\n<h2 id=\"ⅻ-roman\">Ⅻ roman</h2>\n<h2 id=\"text\"><img src=\"a.png\" alt=\"img\"> text</h2>\n<h2 id=\"code\"><code>code</code></h2>\n<h2>---</h2>\n<h2 id=\"link-bold\"><a href=\"http://x\">Link</a> <strong>bold</strong></h2>\n<h2 id=\"ça-va-oui\">Ça va ? Oui !</h2>\n<h2 id=\"under_score__x\">under_score__x</h2>\n<h2 id=\"ölçü-35\">Ölçü 3.5</h2>"
+ },
+ {
+  "name": "setext heading ids",
+  "markdown": "Title\n=====\n\nTitle\n-----\n",
+  "footnotes": false,
+  "html": "<h1 id=\"title\">Title</h1>\n<h2 id=\"title-1\">Title</h2>"
+ },
+ {
+  "name": "footnotes",
+  "footnotes": true,
+  "markdown": "Text[^a] and[^b].\n\n[^a]: First note\n[^b]: Second note\n\n[^c]: unused\n",
+  "html": "<p>\n  Text<sup class=\"footnote-ref\"><a href=\"#fn-a\" id=\"fnref-a\">[1]</a></sup> and<sup class=\"footnote-ref\"><a href=\"#fn-b\" id=\"fnref-b\">[2]</a></sup>.\n</p>\n<section class=\"footnotes\">\n  <hr>\n  <h2 id=\"footnotes\">Footnotes</h2>\n  <ol class=\"footnotes-list\">\n    <li id=\"fn-a\">First note <a href=\"#fnref-a\" class=\"footnote-backref\">↩</a></li>\n    <li id=\"fn-b\">Second note <a href=\"#fnref-b\" class=\"footnote-backref\">↩</a></li>\n  </ol>\n</section>"
+ },
+ {
+  "name": "footnote labels",
+  "footnotes": true,
+  "markdown": "One[^note-1] two[^x_y] three[^é].\n\n[^note-1]: A\n[^x_y]: B\n[^é]: C\n",
+  "html": "<p>\n  One<sup class=\"footnote-ref\"><a href=\"#fn-note-1\" id=\"fnref-note-1\">[1]</a></sup> two<sup class=\"footnote-ref\"><a href=\"#fn-x_y\" id=\"fnref-x_y\">[2]</a></sup> three<sup class=\"footnote-ref\"><a href=\"#fn--e9-\" id=\"fnref--e9-\">[3]</a></sup>.\n</p>\n<section class=\"footnotes\">\n  <hr>\n  <h2 id=\"footnotes\">Footnotes</h2>\n  <ol class=\"footnotes-list\">\n    <li id=\"fn-note-1\">A <a href=\"#fnref-note-1\" class=\"footnote-backref\">↩</a></li>\n    <li id=\"fn-x_y\">B <a href=\"#fnref-x_y\" class=\"footnote-backref\">↩</a></li>\n    <li id=\"fn--e9-\">C <a href=\"#fnref--e9-\" class=\"footnote-backref\">↩</a></li>\n  </ol>\n</section>"
+ },
+ {
+  "name": "no footnotes",
+  "footnotes": true,
+  "markdown": "Plain text.\n",
+  "html": "<p>Plain text.</p>"
+ }
+]
