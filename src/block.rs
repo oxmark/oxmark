@@ -879,11 +879,10 @@ impl<'a, 'o> BlockParser<'a, 'o> {
             padding: 0,
             tight: true,
         };
-        let marker_len;
-        match rest.first() {
+        let marker_len = match rest.first() {
             Some(&c @ (b'*' | b'+' | b'-')) => {
                 data.bullet = c;
-                marker_len = 1;
+                1
             }
             Some(b'0'..=b'9') => {
                 let digits = rest.iter().take_while(|c| c.is_ascii_digit()).count();
@@ -902,10 +901,10 @@ impl<'a, 'o> BlockParser<'a, 'o> {
                 }
                 data.start = start;
                 data.delimiter = d;
-                marker_len = digits + 1;
+                digits + 1
             }
             _ => return Start::None,
-        }
+        };
         match rest.get(marker_len) {
             None | Some(b' ' | b'\t') => {}
             _ => return Start::None,
