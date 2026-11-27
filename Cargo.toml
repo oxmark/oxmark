@@ -1,0 +1,12 @@
+[package]
+name = "oxmark"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "A fast Rust implementation of Comark (Markdown with components)."
+repository = "https://github.com/oxmark/oxmark"
+readme = "README.md"
+keywords = ["markdown", "comark", "parser"]
+categories = ["parser-implementations", "text-processing"]
+
+[dependencies]
