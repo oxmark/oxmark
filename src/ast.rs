@@ -5,8 +5,8 @@
 //! when the text had to be transformed (entities, backslash escapes, content
 //! split across container prefixes such as `>` or list indentation).
 //!
-//! The tree is faithful to the source: raw HTML and every URL are kept as
-//! written. Sanitizing happens when rendering, see
+//! The tree is faithful to the source: raw HTML, every URL and every
+//! attribute are kept as written. Sanitizing happens when rendering, see
 //! [`HtmlOptions`](crate::HtmlOptions).
 
 use std::borrow::Cow;
@@ -14,6 +14,9 @@ use std::borrow::Cow;
 /// A parsed Markdown document.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Document<'a> {
+    /// The YAML frontmatter, as written, when
+    /// [`Options::frontmatter`](crate::Options::frontmatter) is enabled.
+    pub frontmatter: Option<Cow<'a, str>>,
     /// Top-level blocks, in source order.
     pub children: Vec<Block<'a>>,
     /// Footnotes that are referenced, in the order of their first reference.
@@ -51,13 +54,13 @@ pub struct FootnoteReference<'a> {
 #[non_exhaustive]
 pub enum Block<'a> {
     /// A paragraph of inline content.
-    Paragraph(Vec<Inline<'a>>),
+    Paragraph(Paragraph<'a>),
     /// An ATX (`# Title`) or setext (`Title\n===`) heading.
     Heading(Heading<'a>),
     /// A thematic break (`***`, `---`, `___`).
     ThematicBreak,
     /// A block quote (`> ...`).
-    BlockQuote(Vec<Block<'a>>),
+    BlockQuote(BlockQuote<'a>),
     /// A bullet or ordered list.
     List(List<'a>),
     /// A fenced or indented code block.
@@ -66,6 +69,175 @@ pub enum Block<'a> {
     HtmlBlock(Cow<'a, str>),
     /// A GFM table.
     Table(Table<'a>),
+    /// A Comark block component (`::name{props}` ... `::`).
+    Component(Component<'a>),
+}
+
+/// A paragraph.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Paragraph<'a> {
+    /// Attributes from a trailing `{...}`.
+    pub attrs: Attributes<'a>,
+    /// Inline content.
+    pub children: Vec<Inline<'a>>,
+}
+
+/// A block quote.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BlockQuote<'a> {
+    /// The kind of a GFM alert (`> [!NOTE]`), when
+    /// [`Options::alerts`](crate::Options::alerts) is enabled.
+    pub alert: Option<AlertKind>,
+    /// The blocks inside the quote, without the alert marker.
+    pub children: Vec<Block<'a>>,
+}
+
+/// The kind of a GFM alert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertKind {
+    /// `[!NOTE]`
+    Note,
+    /// `[!TIP]`
+    Tip,
+    /// `[!IMPORTANT]`
+    Important,
+    /// `[!WARNING]`
+    Warning,
+    /// `[!CAUTION]`
+    Caution,
+}
+
+impl AlertKind {
+    /// The lowercase name: `note`, `tip`...
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AlertKind::Note => "note",
+            AlertKind::Tip => "tip",
+            AlertKind::Important => "important",
+            AlertKind::Warning => "warning",
+            AlertKind::Caution => "caution",
+        }
+    }
+
+    /// Reads a marker such as `!NOTE`, ignoring case.
+    pub(crate) fn from_marker(marker: &str) -> Option<Self> {
+        let name = marker.strip_prefix('!')?;
+        [
+            AlertKind::Note,
+            AlertKind::Tip,
+            AlertKind::Important,
+            AlertKind::Warning,
+            AlertKind::Caution,
+        ]
+        .into_iter()
+        .find(|k| k.as_str().eq_ignore_ascii_case(name))
+    }
+}
+
+/// A Comark block component:
+///
+/// ```md
+/// ::card{title="Hello"}
+/// Default slot content
+///
+/// #footer
+/// Footer slot content
+/// ::
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Component<'a> {
+    /// The name, in kebab-case (`::MyCard` gives `my-card`).
+    pub name: Cow<'a, str>,
+    /// Props from `{...}` and from a YAML block (`---` or
+    /// ```` ```yaml [props] ````), in Comark's form: a boolean prop is
+    /// `:name="true"` and a YAML value that is not a string is stored as JSON
+    /// under `:name`.
+    pub attrs: Attributes<'a>,
+    /// The default slot: the content before the first named slot.
+    pub children: Vec<Block<'a>>,
+    /// Named slots (`#name`), in source order.
+    pub slots: Vec<Slot<'a>>,
+}
+
+/// A named slot of a block component (`#name`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Slot<'a> {
+    /// The slot name.
+    pub name: Cow<'a, str>,
+    /// Attributes from `#name{...}`.
+    pub attrs: Attributes<'a>,
+    /// The slot content.
+    pub children: Vec<Block<'a>>,
+}
+
+/// One attribute: a name and its value, kept as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attribute<'a> {
+    /// The name. Comark writes a boolean or JSON prop with a `:` prefix.
+    pub name: Cow<'a, str>,
+    /// The value, with its quotes removed.
+    pub value: Cow<'a, str>,
+}
+
+/// The attributes of an element, in order, each name at most once.
+///
+/// They come from Comark's `{.class #id key="value" bool}` syntax.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Attributes<'a>(pub Vec<Attribute<'a>>);
+
+impl<'a> Attributes<'a> {
+    /// Whether there is no attribute.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The value of an attribute.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|a| a.name == name)
+            .map(|a| a.value.as_ref())
+    }
+
+    /// The attributes, in order.
+    pub fn iter(&self) -> std::slice::Iter<'_, Attribute<'a>> {
+        self.0.iter()
+    }
+
+    /// Sets an attribute, keeping its position if it exists. A `class` is
+    /// appended to the existing classes instead.
+    pub fn set(&mut self, name: Cow<'a, str>, value: Cow<'a, str>) {
+        match self.0.iter_mut().find(|a| a.name == name) {
+            Some(a) if name == "class" => {
+                let v = a.value.to_mut();
+                v.push(' ');
+                v.push_str(&value);
+            }
+            Some(a) => a.value = value,
+            None => self.0.push(Attribute { name, value }),
+        }
+    }
+
+    /// Adds every attribute of `other`, like [`set`](Self::set).
+    pub fn merge(&mut self, other: Attributes<'a>) {
+        for a in other.0 {
+            self.set(a.name, a.value);
+        }
+    }
+
+    /// Detaches the attributes from their source.
+    pub fn into_owned(self) -> Attributes<'static> {
+        Attributes(
+            self.0
+                .into_iter()
+                .map(|a| Attribute {
+                    name: Cow::Owned(a.name.into_owned()),
+                    value: Cow::Owned(a.value.into_owned()),
+                })
+                .collect(),
+        )
+    }
 }
 
 /// A heading.
@@ -73,10 +245,12 @@ pub enum Block<'a> {
 pub struct Heading<'a> {
     /// Level from 1 to 6.
     pub level: u8,
-    /// The id computed from the text, when
+    /// The id: an `{#id}` attribute, or the id computed from the text when
     /// [`Options::heading_ids`](crate::Options::heading_ids) is enabled and
     /// the text gives a non-empty id.
-    pub id: Option<String>,
+    pub id: Option<Cow<'a, str>>,
+    /// Attributes from a trailing `{...}`, without the id.
+    pub attrs: Attributes<'a>,
     /// Inline content.
     pub children: Vec<Inline<'a>>,
 }
@@ -111,6 +285,8 @@ pub enum ListKind {
 pub struct ListItem<'a> {
     /// `Some(checked)` for a GFM task list item (`- [ ]` or `- [x]`).
     pub task: Option<bool>,
+    /// Attributes from a trailing `{...}` on the first line of the item.
+    pub attrs: Attributes<'a>,
     /// The blocks inside the item.
     pub children: Vec<Block<'a>>,
 }
@@ -173,21 +349,54 @@ pub enum Inline<'a> {
     /// A hard line break (two trailing spaces or a trailing backslash).
     HardBreak,
     /// A code span.
-    Code(Cow<'a, str>),
+    Code(Code<'a>),
     /// Raw inline HTML, kept verbatim.
     Html(Cow<'a, str>),
     /// Emphasis (`*a*`).
-    Emphasis(Vec<Inline<'a>>),
+    Emphasis(Element<'a>),
     /// Strong emphasis (`**a**`).
-    Strong(Vec<Inline<'a>>),
+    Strong(Element<'a>),
     /// GFM strikethrough (`~~a~~`).
-    Strikethrough(Vec<Inline<'a>>),
+    Strikethrough(Element<'a>),
+    /// A Comark span (`[text]` or `[text]{.class}`).
+    Span(Element<'a>),
+    /// A Comark inline component (`:name`, `:name[content]{props}`).
+    Component(InlineComponent<'a>),
     /// A link.
     Link(Link<'a>),
     /// An image; its children are the alternative text.
     Image(Link<'a>),
     /// A reference to a footnote.
     FootnoteReference(FootnoteReference<'a>),
+}
+
+/// An inline element with attributes and inline content.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Element<'a> {
+    /// Attributes from a following `{...}`.
+    pub attrs: Attributes<'a>,
+    /// Inline content.
+    pub children: Vec<Inline<'a>>,
+}
+
+/// A code span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Code<'a> {
+    /// The code.
+    pub literal: Cow<'a, str>,
+    /// Attributes from a following `{...}`.
+    pub attrs: Attributes<'a>,
+}
+
+/// A Comark inline component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineComponent<'a> {
+    /// The name, as written.
+    pub name: Cow<'a, str>,
+    /// Props from a following `{...}`.
+    pub attrs: Attributes<'a>,
+    /// The content between `[` and `]`.
+    pub children: Vec<Inline<'a>>,
 }
 
 /// The target and content of a link or an image.
@@ -199,6 +408,8 @@ pub struct Link<'a> {
     pub title: Cow<'a, str>,
     /// The kind of syntax that produced the link.
     pub kind: LinkKind,
+    /// Attributes from a following `{...}`.
+    pub attrs: Attributes<'a>,
     /// The link text, or the image description.
     pub children: Vec<Inline<'a>>,
 }
@@ -225,6 +436,7 @@ impl Document<'_> {
     /// Detaches the document from its source by copying every borrowed text.
     pub fn into_owned(self) -> Document<'static> {
         Document {
+            frontmatter: self.frontmatter.map(|f| cow_owned!(f)),
             children: blocks_owned(self.children),
             footnotes: self
                 .footnotes
@@ -252,14 +464,21 @@ impl Block<'_> {
     /// Detaches the block from its source by copying every borrowed text.
     pub fn into_owned(self) -> Block<'static> {
         match self {
-            Block::Paragraph(c) => Block::Paragraph(inlines_owned(c)),
+            Block::Paragraph(p) => Block::Paragraph(Paragraph {
+                attrs: p.attrs.into_owned(),
+                children: inlines_owned(p.children),
+            }),
             Block::Heading(h) => Block::Heading(Heading {
                 level: h.level,
-                id: h.id,
+                id: h.id.map(|id| cow_owned!(id)),
+                attrs: h.attrs.into_owned(),
                 children: inlines_owned(h.children),
             }),
             Block::ThematicBreak => Block::ThematicBreak,
-            Block::BlockQuote(c) => Block::BlockQuote(blocks_owned(c)),
+            Block::BlockQuote(q) => Block::BlockQuote(BlockQuote {
+                alert: q.alert,
+                children: blocks_owned(q.children),
+            }),
             Block::List(l) => Block::List(List {
                 kind: l.kind,
                 tight: l.tight,
@@ -268,6 +487,7 @@ impl Block<'_> {
                     .into_iter()
                     .map(|i| ListItem {
                         task: i.task,
+                        attrs: i.attrs.into_owned(),
                         children: blocks_owned(i.children),
                     })
                     .collect(),
@@ -287,6 +507,20 @@ impl Block<'_> {
                     .map(|r| r.into_iter().map(inlines_owned).collect())
                     .collect(),
             }),
+            Block::Component(c) => Block::Component(Component {
+                name: cow_owned!(c.name),
+                attrs: c.attrs.into_owned(),
+                children: blocks_owned(c.children),
+                slots: c
+                    .slots
+                    .into_iter()
+                    .map(|s| Slot {
+                        name: cow_owned!(s.name),
+                        attrs: s.attrs.into_owned(),
+                        children: blocks_owned(s.children),
+                    })
+                    .collect(),
+            }),
         }
     }
 }
@@ -298,11 +532,20 @@ impl Inline<'_> {
             Inline::Text(t) => Inline::Text(cow_owned!(t)),
             Inline::SoftBreak => Inline::SoftBreak,
             Inline::HardBreak => Inline::HardBreak,
-            Inline::Code(t) => Inline::Code(cow_owned!(t)),
+            Inline::Code(c) => Inline::Code(Code {
+                literal: cow_owned!(c.literal),
+                attrs: c.attrs.into_owned(),
+            }),
             Inline::Html(t) => Inline::Html(cow_owned!(t)),
-            Inline::Emphasis(c) => Inline::Emphasis(inlines_owned(c)),
-            Inline::Strong(c) => Inline::Strong(inlines_owned(c)),
-            Inline::Strikethrough(c) => Inline::Strikethrough(inlines_owned(c)),
+            Inline::Emphasis(e) => Inline::Emphasis(e.into_owned()),
+            Inline::Strong(e) => Inline::Strong(e.into_owned()),
+            Inline::Strikethrough(e) => Inline::Strikethrough(e.into_owned()),
+            Inline::Span(e) => Inline::Span(e.into_owned()),
+            Inline::Component(c) => Inline::Component(InlineComponent {
+                name: cow_owned!(c.name),
+                attrs: c.attrs.into_owned(),
+                children: inlines_owned(c.children),
+            }),
             Inline::Link(l) => Inline::Link(l.into_owned()),
             Inline::Image(l) => Inline::Image(l.into_owned()),
             Inline::FootnoteReference(r) => Inline::FootnoteReference(FootnoteReference {
@@ -314,6 +557,16 @@ impl Inline<'_> {
     }
 }
 
+impl Element<'_> {
+    /// Detaches the element from its source by copying every borrowed text.
+    pub fn into_owned(self) -> Element<'static> {
+        Element {
+            attrs: self.attrs.into_owned(),
+            children: inlines_owned(self.children),
+        }
+    }
+}
+
 impl Link<'_> {
     /// Detaches the link from its source by copying every borrowed text.
     pub fn into_owned(self) -> Link<'static> {
@@ -321,6 +574,7 @@ impl Link<'_> {
             url: cow_owned!(self.url),
             title: cow_owned!(self.title),
             kind: self.kind,
+            attrs: self.attrs.into_owned(),
             children: inlines_owned(self.children),
         }
     }

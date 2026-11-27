@@ -121,3 +121,56 @@ fn blocks() {
         ),
     );
 }
+
+#[test]
+fn comark() {
+    check(
+        "deep block components",
+        &format!("{}x\n{}", rep("::a\n", 5000), rep("::\n", 5000)),
+    );
+    check(
+        "deep counted components",
+        &(3..3000)
+            .map(|i| format!("{}a\n", ":".repeat(i)))
+            .collect::<String>(),
+    );
+    check(
+        "unclosed block components",
+        &rep("::a{b=\"c\"}\nx\n", 20000),
+    );
+    check("unclosed inline components", &rep(":a[", 50000));
+    check(
+        "nested inline components",
+        &format!("{}x{}", rep(":a[", 20000), rep("]", 20000)),
+    );
+    check("unclosed spans", &rep("[a", 50000));
+    check("unclosed attributes", &rep("a{.b ", 50000));
+    check("unclosed attributes after elements", &rep("*a*{.b ", 30000));
+    check("many attributes", &rep("[a]{.b #c d=e} ", 20000));
+    check("unclosed attribute brackets", &rep("[a]{.x-[", 30000));
+    check("unclosed attribute quotes", &rep("[a]{k=\"", 30000));
+    check(
+        "unclosed props",
+        &format!("::a\n{}", rep("```yaml [props]\nk: v\n", 20000)),
+    );
+    check("unclosed dash props", &rep("::a\n---\nk: v\n", 20000));
+    check("many slots", &format!("::a\n{}::", rep("#s\nx\n", 30000)));
+    check(
+        "deep yaml",
+        &format!("::a\n---\nk: {}{}\n---\n::", rep("[", 5000), rep("]", 5000)),
+    );
+    check(
+        "deep yaml blocks",
+        &format!(
+            "::a\n---\n{}\n---\n::",
+            (0..2000)
+                .map(|i| format!("{}k:", " ".repeat(i)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    );
+    check(
+        "frontmatter",
+        &format!("---\n{}---\nx", rep("k: v\n", 50000)),
+    );
+}

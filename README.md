@@ -2,11 +2,11 @@
 
 A fast Rust implementation of Comark (Markdown with components).
 
-> **Status:** early development. The Markdown core is in place: it passes the
-> whole [CommonMark 0.31.2](https://spec.commonmark.org/0.31.2/) test suite
-> (652/652 examples) and the [GFM](https://github.github.com/gfm/) extension
-> examples. Comark components (block and inline components, props, slots) come
-> next.
+> **Status:** early development. The parser passes the whole
+> [CommonMark 0.31.2](https://spec.commonmark.org/0.31.2/) test suite
+> (652/652 examples), the [GFM](https://github.github.com/gfm/) extension
+> examples, and 234 of Comark's 260 runnable SPEC examples. The others need raw
+> HTML parsed into elements, which comes next.
 
 ## Features
 
@@ -14,8 +14,17 @@ A fast Rust implementation of Comark (Markdown with components).
 - GFM extensions: tables, strikethrough, task lists, extended autolinks, and the
   raw HTML tag filter. All are enabled by default and can be turned off one by
   one.
-- Comark-compatible heading ids (on by default) and footnotes (opt-in), with
-  the same slugs and markup as Comark, checked against Comark's own output.
+- Comark syntax, checked against Comark's own SPEC examples:
+  - block components (`::alert{type="info"}` ... `::`), nested with more
+    colons, with YAML props (a `---` block or a ```` ```yaml [props] ```` fence)
+    and named slots (`#title`);
+  - inline components (`:badge[New]{color="green"}`, `:icon{name="x"}`);
+  - spans (`[text]{.class}`) and attributes (`{.class #id key="value"}`) on
+    inline elements, paragraphs, headings and list items;
+  - YAML frontmatter, with `:attr="frontmatter.key"` bindings;
+  - GFM alerts (`> [!NOTE]`);
+  - heading ids (flat or nested) and footnotes (opt-in), with the same slugs
+    and markup as Comark.
 - A typed syntax tree ([`oxmark::ast`](src/ast.rs)) that borrows text from the
   input whenever possible.
 - An HTML renderer that is **safe by default** for untrusted input.
@@ -42,8 +51,25 @@ let html = oxmark::render_html(&doc, &oxmark::HtmlOptions::default());
 
 Options are split in two: `oxmark::Options` selects the syntax extensions,
 and `oxmark::HtmlOptions` controls rendering. `Options::default()` follows
-Comark's defaults (GFM and heading ids); `Options::gfm()` and
-`Options::commonmark()` give plain GFM and strict CommonMark.
+Comark's defaults (GFM, heading ids, components, attributes, frontmatter and
+alerts); `Options::gfm()` and `Options::commonmark()` give plain GFM and strict
+CommonMark.
+
+The HTML follows Comark by default (`HtmlStyle::Comark`): a component with a
+single paragraph loses its `<p>`, list items keep theirs, code blocks carry
+`data-language`, `data-filename` and `data-meta`, and void tags have no slash.
+`HtmlStyle::CommonMark` gives the reference CommonMark output instead.
+
+```rust
+let html = oxmark::to_html("::alert{type=\"info\"}\nBe **careful**.\n::");
+assert_eq!(html, "<alert type=\"info\">Be <strong>careful</strong>.</alert>\n");
+
+let html = oxmark::to_html("A :badge[new]{.green} [word]{title=\"Hi\"}.");
+assert_eq!(
+    html,
+    "<p>A <badge class=\"green\">new</badge> <span title=\"Hi\">word</span>.</p>\n"
+);
+```
 
 ```rust
 let options = oxmark::Options { footnotes: true, ..Default::default() };
@@ -55,10 +81,21 @@ let html = oxmark::to_html_with(
 assert!(html.contains(r##"<a href="#fn-1" id="fnref-1">[1]</a>"##));
 ```
 
-Differences with Comark, on purpose: footnote definitions hold inline
-Markdown (Comark keeps them as plain text), a footnote referenced several
-times gets unique ids (`fnref-a`, `fnref-a-2`), and heading text is not
-NFC-normalized before computing its id.
+Like in Comark, a `[text]` that is not a link is a span, so shortcut
+reference links (`[label]` alone) are only links when components are off.
+
+Differences with Comark, on purpose:
+
+- Raw HTML is escaped by default; Comark parses it into elements (see
+  [Security](#security)).
+- Components that can run code or load content (`script`, `iframe`, `style`,
+  `object`, ...) are dropped with their content, even when Comark's security
+  plugin would keep them.
+- In text, `&` is escaped wherever a browser could read a character
+  reference, so `\&amp;` shows `&amp;` as written.
+- Footnote definitions hold inline Markdown (Comark keeps them as plain text),
+  a footnote referenced several times gets unique ids (`fnref-a`, `fnref-a-2`),
+  and heading text is not NFC-normalized before computing its id.
 
 ## Security
 
@@ -69,14 +106,17 @@ The default `HtmlOptions` are meant for untrusted input:
 | Raw HTML (`<script>`, `<img onerror=...>`, HTML blocks) | Escaped and shown as text (`RawHtml::Escape`). `RawHtml::Omit` drops it instead. |
 | Dangerous URL schemes | `javascript:`, `vbscript:`, `file:` and `data:` URLs become an empty `href`/`src`. `data:image/{png,gif,jpeg,webp}` stays allowed for images. The check decodes entities and ignores case, leading control characters, tabs and line breaks, like browsers do. |
 | Attribute injection | URLs are percent-encoded; titles, alt text, info strings and all text are HTML-escaped. |
+| Component and attribute props | Comark's security rules, on by default (`sanitize`): event handlers (`onclick`, `@click`, `:onClick`), `*html` props (`v-html`, `innerHTML`), `srcdoc`, `formaction`, unsafe URLs in `href`, `src`, `srcset`, `action`, `poster`, ... and `style` with `javascript:`, `expression(` or `url(data:text` are dropped. Values are checked as the browser reads them, with character references and JSON bindings decoded. |
+| Dangerous components | `script`, `style`, `iframe`, `object`, `embed`, `base`, `meta`, `link`, `textarea`, `title`, `noscript`, `xmp` and other such tags are dropped with their content, also through `as` or `is`; an `object` never gets attributes. |
 | `U+0000` | Replaced by `U+FFFD`, as the spec requires. |
-| Denial of service | Pathological inputs (see `tests/pathological.rs`) run in linear time; container and inline nesting are capped at 100 levels; table auto-completion is capped. |
+| Denial of service | Pathological inputs (see `tests/pathological.rs`), including unclosed components, spans, attribute lists and props, run in linear time; container and inline nesting are capped at 100 levels; YAML nesting is capped; table auto-completion is capped. |
 
 `RawHtml::Allow` passes raw HTML through. It keeps the GFM tag filter
 (`<script>`, `<style>`, `<iframe>`, ... are neutralized) unless `tagfilter` is
 turned off, but it is not a sanitizer: only use it with trusted input or
-sanitize the output. `HtmlOptions::trusted()` turns every protection off and
-matches the CommonMark reference output.
+sanitize the output. `HtmlOptions::trusted()` turns every protection off;
+`HtmlOptions::commonmark_trusted()` does the same and matches the CommonMark
+reference output.
 
 ## Performance
 
@@ -95,7 +135,8 @@ cargo run --example md2html < README.md
 ```
 
 `tests/fixtures` holds the spec examples, extracted with
-`scripts/extract_spec.py`. `src/tables.rs` (HTML entities and Unicode classes)
+`scripts/extract_spec.py`, and Comark's SPEC examples, extracted from the
+Comark repository with `scripts/extract_comark_spec.py`. `src/tables.rs` (HTML entities and Unicode classes)
 is generated by `scripts/gen_tables.py`.
 
 ## Releases

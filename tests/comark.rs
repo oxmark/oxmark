@@ -44,16 +44,17 @@ fn footnotes(md: &str) -> String {
 }
 
 #[test]
-fn undefined_footnotes_stay_literal() {
-    assert_eq!(footnotes("Text[^b]."), "<p>Text[^b].</p>\n");
+fn undefined_footnotes_are_spans() {
+    // An undefined footnote is a span, as in Comark.
+    assert_eq!(footnotes("Text[^b]."), "<p>Text<span>^b</span>.</p>\n");
     assert_eq!(
         to_html_with(
             "Text[^a].\n\n[^a]: x",
             &Options::default(),
             &HtmlOptions::default()
         ),
-        // Without the extension, this is a CommonMark link reference.
-        "<p>Text<a href=\"x\">^a</a>.</p>\n"
+        // Without the extension, `[^a]` is a Comark span, as in Comark.
+        "<p>Text<span>^a</span>.</p>\n"
     );
 }
 

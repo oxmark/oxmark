@@ -48,13 +48,37 @@ pub(crate) fn slugify(text: &str) -> String {
 pub(crate) struct HeadingIds {
     counts: HashMap<String, usize>,
     used: HashSet<String>,
+    /// Open sections for nested ids: level and slug.
+    stack: Vec<(u8, String)>,
 }
 
 impl HeadingIds {
-    pub(crate) fn next(&mut self, inlines: &[Inline<'_>]) -> Option<String> {
+    /// Marks an id given by the author as used.
+    pub(crate) fn reserve(&mut self, id: &str) {
+        self.used.insert(id.to_owned());
+    }
+
+    pub(crate) fn next(
+        &mut self,
+        inlines: &[Inline<'_>],
+        level: u8,
+        nested: bool,
+    ) -> Option<String> {
         let mut text = String::new();
         plain_text(inlines, &mut text);
-        let slug = slugify(&text);
+        let mut slug = slugify(&text);
+        if nested {
+            while self.stack.last().is_some_and(|(l, _)| *l >= level) {
+                self.stack.pop();
+            }
+            // A heading takes the id of its section as prefix; h1 gives none.
+            if let Some((l, parent)) = self.stack.last() {
+                if *l >= 2 && !parent.is_empty() && !slug.is_empty() {
+                    slug = format!("{parent}-{slug}");
+                }
+            }
+            self.stack.push((level, slug.clone()));
+        }
         if slug.is_empty() {
             return None;
         }
@@ -78,11 +102,14 @@ impl HeadingIds {
 pub(crate) fn plain_text(inlines: &[Inline<'_>], out: &mut String) {
     for inline in inlines {
         match inline {
-            Inline::Text(t) | Inline::Code(t) => out.push_str(t),
+            Inline::Text(t) => out.push_str(t),
+            Inline::Code(c) => out.push_str(&c.literal),
             Inline::SoftBreak | Inline::HardBreak => out.push(' '),
-            Inline::Emphasis(c) | Inline::Strong(c) | Inline::Strikethrough(c) => {
-                plain_text(c, out)
-            }
+            Inline::Emphasis(e)
+            | Inline::Strong(e)
+            | Inline::Strikethrough(e)
+            | Inline::Span(e) => plain_text(&e.children, out),
+            Inline::Component(c) => plain_text(&c.children, out),
             Inline::Link(l) => plain_text(&l.children, out),
             Inline::Image(_) | Inline::Html(_) | Inline::FootnoteReference(_) => {}
         }

@@ -27,7 +27,7 @@ fn load(json: &str) -> Vec<Example> {
 fn run(examples: &[Example], options: &Options, normalize: fn(&str) -> String) {
     let mut failures = Vec::new();
     for e in examples {
-        let actual = to_html_with(&e.markdown, options, &HtmlOptions::trusted());
+        let actual = to_html_with(&e.markdown, options, &HtmlOptions::commonmark_trusted());
         if normalize(&actual) != normalize(&e.html) {
             failures.push(format!(
                 "example {} ({})\n--- markdown\n{}--- expected\n{}--- actual\n{}",
@@ -79,7 +79,7 @@ fn normalize_gfm(s: &str) -> String {
 fn gfm_extensions() {
     let examples = load(include_str!("fixtures/gfm-0.29-extensions.json"));
     let options = Options::gfm();
-    let mut html = HtmlOptions::trusted();
+    let mut html = HtmlOptions::commonmark_trusted();
     html.tagfilter = true;
     let mut failures = Vec::new();
     for e in &examples {
