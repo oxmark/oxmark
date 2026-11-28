@@ -11,3 +11,8 @@
 Both were extracted from the `spec.txt` sources with `scripts/extract_spec.py`.
 - `comark.json`: HTML rendered by [Comark](https://comark.dev) 0.9.2 (MIT) for
   heading ids and footnotes, generated with `scripts/comark_fixtures.mjs`.
+- `comark-highlight.json`: HTML rendered by Comark 0.9.2 with its highlight
+  (Shiki 3) and mermaid plugins, generated with
+  `scripts/comark_highlight_fixtures.mjs`.
+- `shiki/`: the grammars and themes those cases use, copied from oxlight's
+  fixtures; see `shiki/LICENSES.md` for their licenses.

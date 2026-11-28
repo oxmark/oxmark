@@ -30,8 +30,10 @@ A fast Rust implementation of Comark (Markdown with components).
 - A typed syntax tree ([`oxmark::ast`](src/ast.rs)) that borrows text from the
   input whenever possible.
 - An HTML renderer that is **safe by default** for untrusted input.
+- Optional code highlighting (oxlight) and Mermaid diagrams (oxmaid), with
+  the markup of Comark's plugins.
 - Linear-time parsing on hostile input, bounded nesting, no `unsafe` code and
-  no runtime dependencies.
+  no runtime dependencies without the optional features.
 
 ## Usage
 
@@ -96,6 +98,90 @@ Differences with Comark, on purpose:
 - Footnote definitions hold inline Markdown (Comark keeps them as plain text),
   a footnote referenced several times gets unique ids (`fnref-a`, `fnref-a-2`),
   and heading text is not NFC-normalized before computing its id.
+
+## Code highlighting and Mermaid diagrams
+
+Two optional Cargo features plug in the other Oxmark crates. Both are off by
+default, so the core keeps no dependencies.
+
+```toml
+[dependencies]
+oxmark = { version = "...", features = ["highlight", "mermaid"] }
+```
+
+### Highlighting (`highlight` feature)
+
+Code blocks and inline code are highlighted with
+[oxlight](https://github.com/oxmark/oxlight), a Rust port of Shiki, in the
+same HTML as Comark's highlight plugin (`comark/plugins/highlight`): a light
+and a dark theme as `--shiki-dark` CSS variables, `line` spans, the
+`highlight` class on lines picked with `{1,3-5}`, and inline code with a
+`lang` attribute (`` `let a = 1`{lang="ts"} ``).
+
+```rust,ignore
+let mut highlighter = oxmark::oxlight::Highlighter::new();
+highlighter.load_language_json(&std::fs::read_to_string("typescript.json")?)?;
+highlighter.load_theme_json(&std::fs::read_to_string("github-light.json")?)?;
+highlighter.load_theme_json(&std::fs::read_to_string("github-dark.json")?)?;
+
+let html = oxmark::HtmlOptions {
+    highlight: Some(oxmark::Highlight::new(&highlighter).themes("github-light", "github-dark")),
+    ..Default::default()
+};
+let out = oxmark::to_html_with("```ts\nconst a = 1\n```", &oxmark::Options::default(), &html);
+// <pre data-language="ts" class="shiki shiki-themes github-light github-dark dark:github-dark"><code class="language-ts"><span class="line" style="display: inline">...
+```
+
+Load the languages and themes once (oxlight reads Shiki's JSON files, it does
+not bundle them yet) and share the `Highlighter` between documents and
+threads; grammars are compiled on first use. `Highlight` mirrors Comark's
+options: `light` and `dark` themes (Comark's defaults,
+`material-theme-lighter` and `material-theme-palenight`, when none is set),
+`inline_code` and `pre_styles`. A block whose language is not loaded keeps
+its plain text with a `shiki` class, as in Comark.
+
+The highlighted HTML is written by oxmark: code is escaped like any other
+text, and the attributes of `::pre` components and inline code go through the
+usual security rules. Theme colors are written as they are in the theme
+files, so only load themes you trust.
+
+Not ported: Shiki transformers, and the `ts-type` and `vue-html` inline
+grammar contexts.
+
+### Mermaid (`HtmlOptions::mermaid`, `mermaid` feature)
+
+A fence whose info string starts with `mermaid` is a diagram, as in Comark.
+Props can follow it: ```` ```mermaid {.wide #flow title="Flow"} ````.
+
+- `Mermaid::Off` (default): an ordinary code block.
+- `Mermaid::Component { theme, theme_dark }` (no feature needed): the output
+  of Comark's mermaid plugin, `<mermaid content="...">`, for diagrams drawn in
+  the browser.
+- `Mermaid::Svg(&oxmaid::RenderOptions)` (`mermaid` feature): the diagram is
+  drawn on the server by [oxmaid](https://github.com/oxmark/oxmaid), a Rust
+  port of Mermaid, in the markup of Comark's `Mermaid` component:
+  `<div class="mermaid" style="display: flex; ..."><svg>...</svg></div>`.
+  Each SVG gets the id `{id_prefix}-0`, `{id_prefix}-1`... and its styles are
+  scoped to it; give each document of a page its own `id_prefix`. A diagram
+  oxmaid cannot draw (a syntax error, or a type that is not ported yet, such
+  as sequence diagrams) is rendered as a code block.
+
+```rust,ignore
+let svg = oxmark::oxmaid::RenderOptions::default();
+let html = oxmark::HtmlOptions { mermaid: oxmark::Mermaid::Svg(&svg), ..Default::default() };
+```
+
+The SVG is safe to inline: oxmaid escapes text and attributes, keeps only
+plain inline tags (`<b>`, `<em>`...) in labels, turns `javascript:` links
+into `about:blank`, and drops unsafe style values; the props of the fence go
+through the usual security rules. `tests/mermaid.rs` checks this with XSS
+payloads.
+
+Differences with Comark: a Mermaid fence inside a component is kept (Comark
+drops it), and oxmark escapes `&` in highlighted code as in other text.
+
+On a document with 100 code blocks (43 KB), oxmark with oxlight renders in
+about 275 ms, against 880 ms for Comark with Shiki's JavaScript engine.
 
 ## Security
 

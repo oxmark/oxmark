@@ -19,6 +19,14 @@
 //! through Comark's security rules, and components such as `script` or
 //! `iframe` are dropped. Text and attributes are always escaped.
 //!
+//! # Optional features
+//!
+//! - `highlight`: syntax highlighting of code blocks with
+//!   [oxlight](https://github.com/oxmark/oxlight), like Comark's highlight
+//!   plugin (see [`Highlight`]).
+//! - `mermaid`: Mermaid diagrams drawn to SVG with
+//!   [oxmaid](https://github.com/oxmark/oxmaid) (see [`Mermaid`]).
+//!
 //! [CommonMark 0.31.2]: https://spec.commonmark.org/0.31.2/
 //! [GitHub Flavored Markdown]: https://github.github.com/gfm/
 
@@ -28,9 +36,12 @@
 pub mod ast;
 mod autolink;
 mod block;
+#[cfg(feature = "highlight")]
+mod highlight;
 mod html;
 mod html_tree;
 mod inline;
+mod mermaid;
 mod props;
 mod scan;
 mod slug;
@@ -39,10 +50,17 @@ mod text;
 mod yaml;
 
 pub use ast::Document;
+#[cfg(feature = "highlight")]
+pub use highlight::{Highlight, DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME};
 pub use html::{
     escape_href, escape_html, is_safe_url, render_html, render_html_to, HtmlOptions, HtmlStyle,
     RawHtml,
 };
+pub use mermaid::Mermaid;
+#[cfg(feature = "highlight")]
+pub use oxlight;
+#[cfg(feature = "mermaid")]
+pub use oxmaid;
 
 /// Parsing options: which syntax extensions are enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,7 +182,7 @@ pub fn to_html(input: &str) -> String {
 }
 
 /// Converts Markdown to HTML.
-pub fn to_html_with(input: &str, options: &Options, html: &HtmlOptions) -> String {
+pub fn to_html_with(input: &str, options: &Options, html: &HtmlOptions<'_>) -> String {
     let doc = parse_with(input, options);
     let mut out = String::with_capacity(input.len() + input.len() / 4);
     render_html_to(&doc, html, &mut out);
