@@ -22,6 +22,8 @@ const PIECES: &[&str] = &[
     "[ ]", "[x]", "www.", "http://", "https://", "@", ".com", "javascript:", "\0", "[a]: /u \"t\"\n",
     "::", ":::", "::a", "::a{", ":a[", ":a", "{", "}", "{.c", "{#i}", "{k=\"v\"}", "{:b='[1]'}", "#s",
     "#s{.c}", "```yaml [props]\n", "k: v\n", "- x\n", "{{", "[!NOTE]", "props.x", "frontmatter.y",
+    "<b>", "</b>", "<p>", "</p>", "<pre>", "</pre>", "<script>", "</script>", "<!--\n", "\n-->", "<br/>",
+    "</br>", "<img src=x>", "<DIV class=a>", "</div>", "<!-- c -->",
 ];
 
 #[test]

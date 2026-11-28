@@ -1,13 +1,14 @@
 //! HTML rendering, with sanitizing of raw HTML, URLs and attributes.
 
 use crate::ast::{
-    Alignment, Attribute, Attributes, Block, CodeBlock, Component, Document, Footnote, Inline,
-    Link, List, ListItem, ListKind,
+    Alignment, Attribute, Attributes, Block, CodeBlock, Component, Document, Footnote, HtmlElement,
+    Inline, Link, List, ListItem, ListKind, Node,
 };
 use crate::text::{decode_entities, parse_entity};
 use crate::yaml::Value;
 
-/// What to do with raw HTML (HTML blocks and inline tags) when rendering.
+/// What to do with raw HTML (HTML blocks and inline tags) kept verbatim,
+/// when [`Options::html`](crate::Options::html) is off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RawHtml {
     /// Render raw HTML as escaped text, so it shows up literally.
@@ -38,7 +39,10 @@ pub enum HtmlStyle {
 pub struct HtmlOptions {
     /// The shape of the HTML. Defaults to [`HtmlStyle::Comark`].
     pub style: HtmlStyle,
-    /// Raw HTML policy. Defaults to [`RawHtml::Escape`].
+    /// What to do with raw HTML kept verbatim, when
+    /// [`Options::html`](crate::Options::html) is off. Defaults to
+    /// [`RawHtml::Escape`]. With `Options::html`, raw HTML is parsed into
+    /// elements, which `sanitize` covers.
     pub raw_html: RawHtml,
     /// When `false` (the default), link and image URLs with a dangerous
     /// scheme (`javascript:`, `vbscript:`, `file:`, and `data:` except for
@@ -49,10 +53,12 @@ pub struct HtmlOptions {
     /// `<noembed>`, `<noframes>` and `<plaintext>`). Defaults to `true`.
     pub tagfilter: bool,
     /// Apply the rules of Comark's security plugin to the attributes of
-    /// components, spans and elements: event handlers (`on*`), markup sinks
-    /// (`*html`, `srcdoc`...) and URL attributes with a dangerous scheme are
-    /// dropped. Components that would run code (`script`, `style`, `iframe`,
-    /// `object`...) are dropped with their content. Defaults to `true`.
+    /// components, spans, HTML elements and other elements: event handlers
+    /// (`on*`), markup sinks (`*html`, `srcdoc`...) and URL attributes with a
+    /// dangerous scheme are dropped. Components and HTML elements that would
+    /// run code (`script`, `style`, `iframe`, `object`...) are dropped with
+    /// their content, and a `>` in an HTML comment is escaped. Defaults to
+    /// `true`.
     pub sanitize: bool,
     /// In Comark style, render the single paragraph of a block quote, list
     /// item, component or slot without `<p>`, like Comark's `autoUnwrap`.
@@ -259,8 +265,17 @@ impl Renderer<'_, '_> {
                 .iter()
                 .flat_map(|l| l.iter().map(|a| (&*a.name, &*a.value))),
         );
+        let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for (name, value) in all {
-            match merged.iter_mut().find(|(n, _)| *n == name) {
+            let found = if count <= 16 {
+                merged.iter().position(|(n, _)| *n == name)
+            } else {
+                index.get(name).copied()
+            };
+            if found.is_none() && count > 16 {
+                index.insert(name, merged.len());
+            }
+            match found.map(|i| &mut merged[i]) {
                 Some((_, v)) if name == "class" => {
                     let v = v.to_mut();
                     v.push(' ');
@@ -399,6 +414,16 @@ impl Renderer<'_, '_> {
             }
             Block::Table(table) => self.table(table, &[]),
             Block::Component(c) => self.component(c),
+            Block::HtmlElement(e) => {
+                self.cr();
+                self.html_element(e);
+                self.push("\n");
+            }
+            Block::HtmlComment(c) => {
+                self.cr();
+                self.comment(c);
+                self.push("\n");
+            }
         }
     }
 
@@ -674,6 +699,61 @@ impl Renderer<'_, '_> {
                     .any(|v| is_blocked_tag(v.trim_matches('"'))))
     }
 
+    /// An element parsed from raw HTML, with the security rules of
+    /// components. In Comark style, a single paragraph inside it is unwrapped.
+    fn html_element(&mut self, e: &HtmlElement<'_>) {
+        let tag: &str = &e.tag;
+        if self.blocked(tag, &e.attrs) {
+            return;
+        }
+        let unwrapped = match significant(&e.children) {
+            Some(Node::Block(Block::Paragraph(p)))
+                if self.comark && self.opts.unwrap && tag != "p" =>
+            {
+                Some(p)
+            }
+            _ => None,
+        };
+        match unwrapped {
+            Some(p) => self.open_tag(tag, &[], &[&p.attrs, &e.attrs]),
+            None => self.open_tag(tag, &[], &[&e.attrs]),
+        }
+        if is_void(tag) {
+            return;
+        }
+        match unwrapped {
+            Some(p) => self.inlines(&p.children),
+            None => {
+                for node in &e.children {
+                    match node {
+                        Node::Block(b) => self.block(b, false),
+                        Node::Inline(i) => self.inline(i),
+                    }
+                }
+            }
+        }
+        self.push("</");
+        self.push(tag);
+        self.push(">");
+    }
+
+    /// An HTML comment. When sanitizing, a `>` in it is escaped so that the
+    /// comment cannot end early (`--!>`) and let markup out.
+    fn comment(&mut self, body: &str) {
+        self.push("<!--");
+        if self.opts.sanitize {
+            for (i, part) in body.split('>').enumerate() {
+                if i > 0 {
+                    self.push("&gt;");
+                }
+                self.push(part);
+            }
+        } else {
+            self.push(body);
+        }
+        self.push("-->");
+    }
+
     fn raw_html(&mut self, html: &str) {
         match self.opts.raw_html {
             RawHtml::Escape => {
@@ -718,6 +798,8 @@ impl Renderer<'_, '_> {
                 self.push("</code>");
             }
             Inline::Html(h) => self.raw_html(h),
+            Inline::HtmlElement(e) => self.html_element(e),
+            Inline::HtmlComment(c) => self.comment(c),
             Inline::Emphasis(e) => self.element("em", &e.attrs, &e.children),
             Inline::Strong(e) => self.element("strong", &e.attrs, &e.children),
             Inline::Strikethrough(e) => self.element("del", &e.attrs, &e.children),
@@ -794,6 +876,24 @@ impl Renderer<'_, '_> {
             self.push("\"");
         }
     }
+}
+
+/// The only child that is not blank text, if there is one.
+fn significant<'n, 'a>(nodes: &'n [Node<'a>]) -> Option<&'n Node<'a>> {
+    let mut found = None;
+    for node in nodes {
+        match node {
+            Node::Inline(Inline::Text(t)) if t.trim().is_empty() => {}
+            Node::Inline(Inline::SoftBreak) => {}
+            n => {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(n);
+            }
+        }
+    }
+    found
 }
 
 fn no_dupes<'s>(mut names: impl Iterator<Item = &'s str>) -> bool {
@@ -1074,6 +1174,14 @@ fn alt_text(out: &mut String, inlines: &[Inline<'_>]) {
                 out.push_str(itoa(r.index, &mut [0; 10]));
                 out.push(']');
             }
+            Inline::HtmlElement(e) => {
+                for node in &e.children {
+                    if let Node::Inline(i) = node {
+                        alt_text(out, std::slice::from_ref(i));
+                    }
+                }
+            }
+            Inline::HtmlComment(_) => {}
         }
     }
 }

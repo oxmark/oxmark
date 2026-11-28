@@ -173,4 +173,46 @@ fn comark() {
         "frontmatter",
         &format!("---\n{}---\nx", rep("k: v\n", 50000)),
     );
+    let many = |p: &str| (0..30000).map(|i| format!("{p}{i}=b ")).collect::<String>();
+    check("many distinct props", &format!(":a{{{}}}", many("a")));
+    check(
+        "props merged on unwrap",
+        &format!("::a{{{}}}\nx {{{}}}\n::", many("a"), many("b")),
+    );
+}
+
+#[test]
+fn html() {
+    check("nested open tags", &rep("<div>", 50000));
+    check(
+        "nested inline tags",
+        &format!("{}x{}", rep("<b>", 50000), rep("</b>", 50000)),
+    );
+    check("stray close tags", &rep("x</div>", 50000));
+    check("crossed tags", &rep("<a><b></a></b>", 20000));
+    check("open tags in paragraphs", &rep("<div>\n\n", 50000));
+    check("close then open", &rep("</div><div>\n\n", 30000));
+    check(
+        "tags in quotes",
+        &format!("{}x", rep("> <div>", 100).replace("> <div>", "> <div>\n>")),
+    );
+    check("tags in list items", &rep("- <div>\n  ", 5000));
+    check(
+        "unclosed comments in paragraphs",
+        &rep("a <!-- b\n\n", 30000),
+    );
+    check("split comments", &rep("<!--\n\n-->\n\n", 30000));
+    check("unclosed raw tags", &rep("<pre>\n<script>", 30000));
+    check(
+        "many attributes",
+        &format!("<div {}>", rep("a=\"b\" ", 50000)),
+    );
+    check(
+        "many distinct attributes",
+        &format!(
+            "<div {}>",
+            (0..50000).map(|i| format!("a{i}=b ")).collect::<String>()
+        ),
+    );
+    check("comment frames", &rep("x <!--\n\n", 20000));
 }

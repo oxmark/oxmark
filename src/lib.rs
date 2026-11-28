@@ -4,20 +4,17 @@
 //! extensions (tables, strikethrough, task lists and extended autolinks) and
 //! the Comark syntax: block and inline components with props and slots,
 //! spans, attributes, frontmatter, alerts, heading ids and footnotes. Raw
-//! HTML is not parsed into elements yet.
+//! HTML is parsed into elements, as in Comark.
 //!
 //! ```
-//! let html = oxmark::to_html("Hello *world* <script>alert(1)</script>");
-//! assert_eq!(
-//!     html,
-//!     "<p>Hello <em>world</em> &lt;script&gt;alert(1)&lt;/script&gt;</p>\n"
-//! );
+//! let html = oxmark::to_html("Hello *world* <img src=x onerror=alert(1)>");
+//! assert_eq!(html, "<p>Hello <em>world</em> <img src=\"x\"></p>\n");
 //! ```
 //!
 //! # Security
 //!
-//! The default [`HtmlOptions`] are safe for untrusted input: raw HTML is
-//! escaped, URLs with a dangerous scheme (`javascript:`, `vbscript:`,
+//! The default [`HtmlOptions`] are safe for untrusted input: HTML elements
+//! go through the same rules as components, URLs with a dangerous scheme (`javascript:`, `vbscript:`,
 //! `file:`, non-image `data:`) are dropped, component and attribute props go
 //! through Comark's security rules, and components such as `script` or
 //! `iframe` are dropped. Text and attributes are always escaped.
@@ -32,6 +29,7 @@ pub mod ast;
 mod autolink;
 mod block;
 mod html;
+mod html_tree;
 mod inline;
 mod props;
 mod scan;
@@ -83,11 +81,21 @@ pub struct Options {
     /// GFM alerts: a block quote starting with `[!NOTE]`, `[!TIP]`,
     /// `[!IMPORTANT]`, `[!WARNING]` or `[!CAUTION]`.
     pub alerts: bool,
+    /// Raw HTML parsed into elements, like Comark does: tags become
+    /// [`ast::HtmlElement`]s and the Markdown between them becomes their
+    /// children (`<div>\n**a**\n</div>` gives a `div` holding a `strong`).
+    /// Only `<script>`, `<style>`, `<pre>`, `<textarea>` and comments start
+    /// an HTML block; other tags start a paragraph.
+    ///
+    /// The elements are rendered with the same security rules as components
+    /// (see [`HtmlOptions::sanitize`]). When this is off, raw HTML is kept
+    /// as written and rendered by [`HtmlOptions::raw_html`].
+    pub html: bool,
 }
 
 impl Default for Options {
     /// The Comark defaults: every GFM extension, heading ids, components,
-    /// attributes and frontmatter. Footnotes are off, as in Comark where they
+    /// attributes, frontmatter, alerts and raw HTML as elements. Footnotes are off, as in Comark where they
     /// come from an optional plugin.
     fn default() -> Self {
         Options {
@@ -96,6 +104,7 @@ impl Default for Options {
             attributes: true,
             frontmatter: true,
             alerts: true,
+            html: true,
             ..Options::gfm()
         }
     }
@@ -116,6 +125,7 @@ impl Options {
             attributes: false,
             frontmatter: false,
             alerts: false,
+            html: false,
         }
     }
 

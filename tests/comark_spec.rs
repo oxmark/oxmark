@@ -25,22 +25,11 @@ fn normalize(html: &str) -> String {
     out
 }
 
-/// Cases that oxmark renders differently on purpose, or does not support yet.
+/// Cases that oxmark renders differently on purpose.
 fn known_difference(name: &str) -> bool {
-    // Raw HTML is escaped by default; Comark parses it into elements. Raw
-    // HTML as nodes comes in a later version.
-    name.starts_with("HTML/")
-        || name.starts_with("COMARK/comment-")
-        || matches!(
-            name,
-            "COMARK/component-nested-multiline-separated"
-                | "common-mark/html-block-void-br"
-                | "common-mark/html-block-void-element"
-                | "common-mark/ordered-list-item-comment"
-                // Comark writes `\&amp;` as `&amp;`, which reads back as `&`.
-                // oxmark escapes the `&` so the text shows `&amp;` as written.
-                | "common-mark/paragraph-escaped-entity"
-        )
+    // Comark writes `\&amp;` as `&amp;`, which reads back as `&`. oxmark
+    // escapes the `&` so the text shows `&amp;` as written.
+    name == "common-mark/paragraph-escaped-entity"
 }
 
 /// The options of a case, or `None` when it needs a Comark plugin that
