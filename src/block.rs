@@ -249,6 +249,9 @@ pub(crate) struct BlockParser<'a, 'o> {
     all_closed: bool,
     line: &'a str,
     line_number: usize,
+    /// The closing marker of the current line, as `(line number, start,
+    /// colons)`: computed once per line rather than once per open component.
+    marker: (usize, usize, Option<usize>),
     offset: usize,
     column: usize,
     next_nonspace: usize,
@@ -302,6 +305,7 @@ impl<'a, 'o> BlockParser<'a, 'o> {
             blank: false,
             partially_consumed_tab: false,
             line_consumed: false,
+            marker: (0, usize::MAX, None),
             scratch: RefCell::default(),
             footnote_defs: HashMap::new(),
             heading_ids: RefCell::default(),
@@ -697,7 +701,7 @@ impl<'a, 'o> BlockParser<'a, 'o> {
                     }
                 }
                 if !in_fence && !self.indented {
-                    if let Some(n) = bare_marker(&self.line.as_bytes()[self.next_nonspace..]) {
+                    if let Some(n) = self.bare_marker() {
                         if n == count && !self.nested_component(idx, n) {
                             while self.tip != idx {
                                 self.finalize(self.tip, self.line_number);
@@ -1023,6 +1027,16 @@ impl<'a, 'o> BlockParser<'a, 'o> {
             }
         }
         None
+    }
+
+    /// [`bare_marker`] of the current line from `next_nonspace`, cached.
+    fn bare_marker(&mut self) -> Option<usize> {
+        let key = (self.line_number, self.next_nonspace);
+        if (self.marker.0, self.marker.1) != key {
+            let n = bare_marker(&self.line.as_bytes()[self.next_nonspace..]);
+            self.marker = (key.0, key.1, n);
+        }
+        self.marker.2
     }
 
     /// Whether an open component inside `idx` uses the same closing marker.
