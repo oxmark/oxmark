@@ -84,7 +84,7 @@ dependencies = [
 [[package]]
 name = "oxmaid"
 version = "0.0.0"
-source = "git+https://github.com/oxmark/oxmaid#7c02584625ec4ec73625e38434aa98607a174686"
+source = "git+https://github.com/oxmark/oxmaid#8d2c36543f43f19485f96002bf731055b724e899"
 
 [[package]]
 name = "oxmark"
