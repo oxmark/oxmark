@@ -4,6 +4,9 @@ use crate::ast::{
     Alignment, Attribute, Attributes, Block, CodeBlock, Component, Document, Footnote, HtmlElement,
     Inline, Link, List, ListItem, ListKind, Node,
 };
+#[cfg(feature = "highlight")]
+use crate::highlight::Highlight;
+use crate::mermaid::Mermaid;
 use crate::text::{decode_entities, parse_entity};
 use crate::yaml::Value;
 
@@ -35,8 +38,8 @@ pub enum HtmlStyle {
 }
 
 /// HTML rendering options. The defaults are safe for untrusted input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HtmlOptions {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HtmlOptions<'a> {
     /// The shape of the HTML. Defaults to [`HtmlStyle::Comark`].
     pub style: HtmlStyle,
     /// What to do with raw HTML kept verbatim, when
@@ -64,9 +67,17 @@ pub struct HtmlOptions {
     /// item, component or slot without `<p>`, like Comark's `autoUnwrap`.
     /// Defaults to `true`.
     pub unwrap: bool,
+    /// How ```` ```mermaid ```` fences are rendered. Defaults to
+    /// [`Mermaid::Off`]: they are ordinary code blocks.
+    pub mermaid: Mermaid<'a>,
+    /// Syntax highlighting of code blocks and inline code with
+    /// [oxlight](https://github.com/oxmark/oxlight), like Comark's highlight
+    /// plugin. Defaults to `None`.
+    #[cfg(feature = "highlight")]
+    pub highlight: Option<Highlight<'a>>,
 }
 
-impl Default for HtmlOptions {
+impl Default for HtmlOptions<'_> {
     fn default() -> Self {
         HtmlOptions {
             style: HtmlStyle::Comark,
@@ -75,11 +86,14 @@ impl Default for HtmlOptions {
             tagfilter: true,
             sanitize: true,
             unwrap: true,
+            mermaid: Mermaid::Off,
+            #[cfg(feature = "highlight")]
+            highlight: None,
         }
     }
 }
 
-impl HtmlOptions {
+impl HtmlOptions<'_> {
     /// Options that trust the input completely: raw HTML, every URL and every
     /// attribute are rendered as written, without the GFM tag filter.
     pub fn trusted() -> Self {
@@ -103,14 +117,14 @@ impl HtmlOptions {
 }
 
 /// Renders a document to HTML.
-pub fn render_html(doc: &Document<'_>, options: &HtmlOptions) -> String {
+pub fn render_html(doc: &Document<'_>, options: &HtmlOptions<'_>) -> String {
     let mut out = String::with_capacity(256);
     render_html_to(doc, options, &mut out);
     out
 }
 
 /// Renders a document to HTML, appending to `out`.
-pub fn render_html_to(doc: &Document<'_>, options: &HtmlOptions, out: &mut String) {
+pub fn render_html_to(doc: &Document<'_>, options: &HtmlOptions<'_>, out: &mut String) {
     let mut r = Renderer {
         out,
         opts: options,
@@ -118,6 +132,9 @@ pub fn render_html_to(doc: &Document<'_>, options: &HtmlOptions, out: &mut Strin
         frontmatter_src: doc.frontmatter.as_deref(),
         frontmatter: None,
         scopes: Vec::new(),
+        diagrams: 0,
+        #[cfg(feature = "highlight")]
+        highlight: options.highlight.as_ref().map(crate::highlight::State::new),
     };
     r.blocks(&doc.children, false);
     if !doc.footnotes.is_empty() {
@@ -159,29 +176,35 @@ fn is_void(tag: &str) -> bool {
 }
 
 /// An attribute to write: a name and a value.
-type Attr<'s> = (&'s str, &'s str);
+pub(crate) type Attr<'s> = (&'s str, &'s str);
 
-struct Renderer<'o, 'w> {
-    out: &'w mut String,
-    opts: &'o HtmlOptions,
+pub(crate) struct Renderer<'o, 'w> {
+    pub(crate) out: &'w mut String,
+    pub(crate) opts: &'o HtmlOptions<'o>,
     comark: bool,
     /// The frontmatter, parsed when a binding first needs it.
     frontmatter_src: Option<&'w str>,
     frontmatter: Option<Option<Value>>,
     /// The props of the enclosing components, for `props.x` bindings.
     scopes: Vec<Vec<(String, Value)>>,
+    /// Mermaid diagrams rendered so far, for unique SVG ids.
+    #[cfg_attr(not(feature = "mermaid"), allow(dead_code))]
+    pub(crate) diagrams: usize,
+    /// Highlighting options resolved once per document.
+    #[cfg(feature = "highlight")]
+    pub(crate) highlight: Option<crate::highlight::State<'o>>,
 }
 
 impl Renderer<'_, '_> {
     #[inline]
-    fn cr(&mut self) {
+    pub(crate) fn cr(&mut self) {
         if !self.out.is_empty() && !self.out.ends_with('\n') {
             self.out.push('\n');
         }
     }
 
     #[inline]
-    fn push(&mut self, s: &str) {
+    pub(crate) fn push(&mut self, s: &str) {
         self.out.push_str(s);
     }
 
@@ -226,7 +249,7 @@ impl Renderer<'_, '_> {
         }
     }
 
-    fn open_tag(&mut self, tag: &str, extra: &[Attr<'_>], attrs: &[&Attributes<'_>]) {
+    pub(crate) fn open_tag(&mut self, tag: &str, extra: &[Attr<'_>], attrs: &[&Attributes<'_>]) {
         self.push("<");
         self.push(tag);
         self.attrs(tag, extra, attrs);
@@ -290,7 +313,63 @@ impl Renderer<'_, '_> {
         }
     }
 
-    fn attr(&mut self, name: &str, value: &str) {
+    /// Opens a tag whose `class` is set by the renderer, like Comark's
+    /// plugins do: `own` attributes first, then `lists` (where a user class
+    /// gives its position to the class, written `"{class} . {user}"`), then
+    /// `after`.
+    #[cfg_attr(not(feature = "highlight"), allow(dead_code))]
+    pub(crate) fn open_tag_with_class(
+        &mut self,
+        tag: &str,
+        own: &[Attr<'_>],
+        lists: &[&Attributes<'_>],
+        class: &str,
+        after: &[Attr<'_>],
+    ) {
+        use std::borrow::Cow;
+        let count = own.len() + lists.iter().map(|l| l.0.len()).sum::<usize>() + 1;
+        let mut merged: Vec<(&str, Cow<'_, str>)> = Vec::with_capacity(count + after.len());
+        merged.extend(own.iter().map(|&(n, v)| (n, Cow::Borrowed(v))));
+        let mut user: Option<(usize, String)> = None;
+        for list in lists {
+            for a in list.iter() {
+                let (name, value) = (&*a.name, &*a.value);
+                if name == "class" {
+                    match &mut user {
+                        Some((_, c)) => {
+                            c.push(' ');
+                            c.push_str(value);
+                        }
+                        None => {
+                            user = Some((merged.len(), value.to_owned()));
+                            merged.push(("class", Cow::Borrowed("")));
+                        }
+                    }
+                } else if let Some(i) = merged.iter().position(|(n, _)| *n == name) {
+                    merged[i].1 = Cow::Borrowed(value);
+                } else {
+                    merged.push((name, Cow::Borrowed(value)));
+                }
+            }
+        }
+        let value = match &user {
+            Some((_, u)) if !u.trim().is_empty() => format!("{class} . {}", u.trim()),
+            _ => class.to_owned(),
+        };
+        match user {
+            Some((i, _)) => merged[i].1 = Cow::Owned(value),
+            None => merged.push(("class", Cow::Owned(value))),
+        }
+        merged.extend(after.iter().map(|&(n, v)| (n, Cow::Borrowed(v))));
+        self.push("<");
+        self.push(tag);
+        for (name, value) in &merged {
+            self.attr(name, value);
+        }
+        self.push(">");
+    }
+
+    pub(crate) fn attr(&mut self, name: &str, value: &str) {
         if let Some(key) = name.strip_prefix(':') {
             if let Some(v) = self.resolve(value) {
                 match v {
@@ -580,9 +659,22 @@ impl Renderer<'_, '_> {
         self.push("</li>\n");
     }
 
-    fn code_block(&mut self, code: &CodeBlock<'_>, extra: &[&Attributes<'_>]) {
+    pub(crate) fn code_block(&mut self, code: &CodeBlock<'_>, extra: &[&Attributes<'_>]) {
+        if !matches!(self.opts.mermaid, Mermaid::Off) && crate::mermaid::is_mermaid(code) {
+            crate::mermaid::render(self, code, extra);
+            return;
+        }
+        self.plain_code_block(code, extra);
+    }
+
+    /// A code block that is not a Mermaid diagram.
+    pub(crate) fn plain_code_block(&mut self, code: &CodeBlock<'_>, extra: &[&Attributes<'_>]) {
         self.cr();
-        if !self.comark {
+        #[cfg(feature = "highlight")]
+        let highlighting = self.highlight.is_some();
+        #[cfg(not(feature = "highlight"))]
+        let highlighting = false;
+        if !self.comark && !highlighting {
             self.push("<pre><code");
             if let Some(lang) = code.language() {
                 self.push(" class=\"language-");
@@ -605,6 +697,12 @@ impl Renderer<'_, '_> {
                 InfoPart::Meta => own.push(("data-meta", info.meta)),
             }
         }
+        let literal = code.literal.strip_suffix('\n').unwrap_or(&code.literal);
+        #[cfg(feature = "highlight")]
+        if highlighting {
+            crate::highlight::code_block(self, &info, literal, &own, extra);
+            return;
+        }
         self.open_tag("pre", &own, extra);
         self.push("<code");
         if !info.language.is_empty() {
@@ -613,7 +711,6 @@ impl Renderer<'_, '_> {
             self.push("\"");
         }
         self.push(">");
-        let literal = code.literal.strip_suffix('\n').unwrap_or(&code.literal);
         escape_text(self.out, literal);
         self.push("</code></pre>\n");
     }
@@ -793,6 +890,10 @@ impl Renderer<'_, '_> {
                 self.push("\n");
             }
             Inline::Code(c) => {
+                #[cfg(feature = "highlight")]
+                if crate::highlight::inline_code(self, c) {
+                    return;
+                }
                 self.open_tag("code", &[], &[&c.attrs]);
                 self.text(&c.literal);
                 self.push("</code>");
@@ -1051,9 +1152,9 @@ enum InfoPart {
 
 /// A code block info string, read like Comark: a language, `{1-3,5}` line
 /// highlights and a `[filename]` in any order, and the rest as metadata.
-struct CodeInfo<'s> {
-    language: &'s str,
-    highlights: Vec<u32>,
+pub(crate) struct CodeInfo<'s> {
+    pub(crate) language: &'s str,
+    pub(crate) highlights: Vec<u32>,
     filename: String,
     meta: &'s str,
     order: Vec<InfoPart>,

@@ -34,7 +34,7 @@ fn known_difference(name: &str) -> bool {
 
 /// The options of a case, or `None` when it needs a Comark plugin that
 /// oxmark does not have (syntax highlighting, emoji, bindings).
-fn options(v: &serde_json::Value) -> Option<(Options, HtmlOptions)> {
+fn options(v: &serde_json::Value) -> Option<(Options, HtmlOptions<'static>)> {
     let mut options = Options::default();
     let mut html = HtmlOptions::default();
     for (key, value) in v.as_object().unwrap() {

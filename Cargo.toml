@@ -11,7 +11,17 @@ exclude = ["/scripts", "/tests/fixtures"]
 keywords = ["markdown", "commonmark", "gfm", "comark", "parser"]
 categories = ["parser-implementations", "text-processing"]
 
+[features]
+default = []
+# Syntax highlighting of code blocks with oxlight, like Comark's highlight plugin.
+highlight = ["dep:oxlight"]
+# Mermaid diagrams rendered to SVG with oxmaid.
+mermaid = ["dep:oxmaid"]
+
 [dependencies]
+# Git dependencies until oxlight and oxmaid have releases on crates.io.
+oxlight = { git = "https://github.com/oxmark/oxlight", optional = true }
+oxmaid = { git = "https://github.com/oxmark/oxmaid", optional = true }
 
 [dev-dependencies]
 serde_json = "1.0.154"
